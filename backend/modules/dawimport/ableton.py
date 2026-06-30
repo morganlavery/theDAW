@@ -232,6 +232,8 @@ def _parse_midi_notes(clip_elem, beat_sec: float) -> list[dict] | None:
         midi_key = _read_float_attr(key_track, "MidiKey", math.nan)
         if math.isnan(midi_key):
             midi_key = _read_first_float(key_track, ("MidiKey",), math.nan)
+        if math.isnan(midi_key):
+            continue
         for note_event in key_track.findall(".//MidiNoteEvent"):
             start = _read_float_attr(note_event, "Time", _read_first_float(note_event, ("Time",), 0.0))
             duration = _read_float_attr(note_event, "Duration", _read_first_float(note_event, ("Duration",), 0.25))
