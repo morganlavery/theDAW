@@ -7,6 +7,7 @@ import {
   Layers,
   Loader2,
   PackagePlus,
+  Scissors,
   X,
 } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
@@ -17,6 +18,7 @@ import { DAW_LABELS } from '../../lib/dawImportClient';
 import { dawProjectToTasmo } from '../../lib/projectClient';
 import { DAW_PROJECT_FILTER } from '../../lib/fileFilters';
 import { DawSessionGrid } from '../session/DawSessionGrid';
+import { importDawProjectToEditor } from '../../lib/dawProjectToEditor';
 
 export const DawImportModal: React.FC = () => {
   const { isOpen, sourcePath, detected, project, hint, busy, error } = useDawImportStore(
@@ -34,12 +36,24 @@ export const DawImportModal: React.FC = () => {
   const setSourcePath = useDawImportStore((s) => s.setSourcePath);
   const detectAndImport = useDawImportStore((s) => s.detectAndImport);
   const openProject = useProjectStore((s) => s.open);
+  const [timelineBusy, setTimelineBusy] = React.useState(false);
 
   if (!isOpen) return null;
 
   const saveAsTasmo = () => {
     if (!project) return;
     openProject('save', dawProjectToTasmo(project));
+  };
+
+  const editInTimeline = async () => {
+    if (!project) return;
+    setTimelineBusy(true);
+    try {
+      await importDawProjectToEditor(project);
+      close();
+    } finally {
+      setTimelineBusy(false);
+    }
   };
 
   return (
@@ -144,14 +158,26 @@ export const DawImportModal: React.FC = () => {
 
               <DawSessionGrid project={project} />
 
-              <button
-                type="button"
-                onClick={saveAsTasmo}
-                className="btn-ghost inline-flex items-center justify-center gap-1.5"
-              >
-                <PackagePlus className="w-3 h-3" />
-                Save as .tasmo…
-              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={saveAsTasmo}
+                  className="btn-ghost inline-flex items-center justify-center gap-1.5"
+                >
+                  <PackagePlus className="w-3 h-3" />
+                  Save as .tasmo…
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void editInTimeline()}
+                  disabled={timelineBusy}
+                  className="btn-primary inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                  title="Load this imported project into the editable timeline"
+                >
+                  {timelineBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Scissors className="w-3 h-3" />}
+                  Edit Timeline
+                </button>
+              </div>
             </div>
           )}
 

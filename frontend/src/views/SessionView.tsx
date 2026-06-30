@@ -1,5 +1,5 @@
 import React from 'react';
-import { AlertCircle, AlertTriangle, FolderInput, Layers, Loader2, PackagePlus } from 'lucide-react';
+import { AlertCircle, AlertTriangle, FolderInput, Layers, Loader2, PackagePlus, Scissors } from 'lucide-react';
 import { useShallow } from 'zustand/react/shallow';
 import { useDawImportStore } from '../state/dawImportStore';
 import { useProjectStore } from '../state/projectStore';
@@ -8,6 +8,7 @@ import { dawProjectToTasmo } from '../lib/projectClient';
 import { DAW_PROJECT_FILTER } from '../lib/fileFilters';
 import { PathInput } from '../components/ui/PathInput';
 import { DawSessionGrid } from '../components/session/DawSessionGrid';
+import { importDawProjectToEditor } from '../lib/dawProjectToEditor';
 
 export const SessionView: React.FC = () => {
   const { sourcePath, detected, project, hint, busy, error } = useDawImportStore(
@@ -23,10 +24,21 @@ export const SessionView: React.FC = () => {
   const setSourcePath = useDawImportStore((s) => s.setSourcePath);
   const detectAndImport = useDawImportStore((s) => s.detectAndImport);
   const openProject = useProjectStore((s) => s.open);
+  const [timelineBusy, setTimelineBusy] = React.useState(false);
 
   const saveAsTasmo = () => {
     if (!project) return;
     openProject('save', dawProjectToTasmo(project));
+  };
+
+  const editInTimeline = async () => {
+    if (!project) return;
+    setTimelineBusy(true);
+    try {
+      await importDawProjectToEditor(project);
+    } finally {
+      setTimelineBusy(false);
+    }
   };
 
   return (
@@ -54,6 +66,16 @@ export const SessionView: React.FC = () => {
             >
               <PackagePlus className="w-3 h-3" />
               .tasmo
+            </button>
+            <button
+              type="button"
+              onClick={() => void editInTimeline()}
+              disabled={timelineBusy}
+              className="h-7 px-2 inline-flex items-center gap-1 rounded border border-emerald-400/30 text-emerald-100 hover:text-white hover:bg-emerald-400/10 disabled:opacity-45"
+              title="Load this imported project into the editable timeline"
+            >
+              {timelineBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Scissors className="w-3 h-3" />}
+              Edit Timeline
             </button>
           </div>
         )}

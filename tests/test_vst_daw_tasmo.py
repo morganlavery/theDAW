@@ -219,6 +219,56 @@ def test_ableton_parser_preserves_session_grid(tmp_path):
     print("  ableton session grid OK")
 
 
+def test_ableton_parser_reads_arrangement_clips(tmp_path):
+    from backend.modules.dawimport.ableton import parse_als
+
+    sample = tmp_path / "lead.wav"
+    sample.write_bytes(b"RIFF....fake-wav")
+    als = tmp_path / "arrangement.als"
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Ableton>
+  <LiveSet>
+    <MasterTrack><Mixer><Tempo><Manual Value="120"/></Tempo></Mixer></MasterTrack>
+    <Tracks>
+      <AudioTrack>
+        <Name><EffectiveName Value="Lead"/></Name>
+        <DeviceChain>
+          <Mixer><Volume><Manual Value="1"/></Volume><Pan><Manual Value="0"/></Pan></Mixer>
+          <MainSequencer>
+            <ClipTimeable>
+              <ArrangerAutomation>
+                <Events>
+                  <AudioClip>
+                    <Name Value="Lead Hook"/>
+                    <CurrentStart Value="8"/>
+                    <CurrentEnd Value="16"/>
+                    <Loop><LoopStart Value="0"/><LoopEnd Value="8"/></Loop>
+                    <SampleRef><FileRef><RelativePath Value="{sample.name}"/></FileRef></SampleRef>
+                  </AudioClip>
+                </Events>
+              </ArrangerAutomation>
+            </ClipTimeable>
+          </MainSequencer>
+        </DeviceChain>
+      </AudioTrack>
+    </Tracks>
+  </LiveSet>
+</Ableton>
+"""
+    als.write_bytes(gzip.compress(xml.encode("utf-8")))
+
+    project = parse_als(str(als))
+
+    assert len(project.tracks) == 1
+    clip = project.tracks[0].clips[0]
+    assert clip.name == "Lead Hook"
+    assert clip.scene_index is None
+    assert clip.start_time == 4.0
+    assert clip.end_time == 8.0
+    assert clip.file_path == str(sample)
+    print("  ableton arrangement clips OK")
+
+
 def test_reaper_parser_structure():
     from backend.modules.dawimport.reaper import parse_rpp
 

@@ -202,7 +202,9 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   }, [tracks.length]);
 
   const ensureAudioContext = React.useCallback(() => {
-    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    const AudioContextCtor =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
     if (!audioContextRef.current && AudioContextCtor) {
       audioContextRef.current = new AudioContextCtor();
     }

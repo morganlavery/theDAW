@@ -94,7 +94,7 @@ def _parse_tracks(tracks_elem, project: DawProject, als_path: Path) -> None:
         track_type = _tag_to_type.get(track_elem.tag)
         if track_type is None:
             continue
-        project.tracks.append(_parse_track(track_elem, track_type, track_index, project.scenes, als_path))
+        project.tracks.append(_parse_track(track_elem, track_type, track_index, project.scenes, als_path, project.tempo))
         track_index += 1
 
 
@@ -104,6 +104,7 @@ def _parse_track(
     track_index: int,
     scenes: list[str],
     als_path: Path,
+    tempo: float,
 ) -> DawTrack:
     name_elem = track_elem.find(".//Name/EffectiveName")
     name = name_elem.get("Value", "Track") if name_elem is not None else "Track"
@@ -146,6 +147,8 @@ def _parse_track(
             )
         )
 
+    clips.extend(_parse_arrangement_clips(track_elem, track_index, als_path, tempo))
+
     devices: list[DawDevice] = []
     for dev in track_elem.iter("AudioEffectDevice"):
         dev_name = dev.get("ClassName", "Unknown")
@@ -170,6 +173,101 @@ def _parse_track(
         clips=clips,
         devices=devices,
     )
+
+
+def _parse_arrangement_clips(track_elem, track_index: int, als_path: Path, tempo: float) -> list[DawClip]:
+    """Read Ableton Arrangement View clips from a track.
+
+    Live stores timeline clips under MainSequencer/ClipTimeable/ArrangerAutomation
+    in beat units. Convert to seconds so the shared DawProject model matches the
+    editor timeline and the other importers.
+    """
+    clips: list[DawClip] = []
+    events = track_elem.findall("./DeviceChain/MainSequencer/ClipTimeable/ArrangerAutomation/Events/*")
+    beat_sec = 60.0 / tempo if tempo > 0 else 0.5
+    for clip_elem in events:
+        if clip_elem.tag not in {"AudioClip", "MidiClip"}:
+            continue
+        name_elem = clip_elem.find("Name")
+        name = name_elem.get("Value", "Clip") if name_elem is not None else "Clip"
+        start_beats = _read_first_float(
+            clip_elem,
+            ("CurrentStart", "Time", "Start", "StartTime"),
+            _read_float_attr(clip_elem, "Time", 0.0),
+        )
+        end_beats = _read_first_float(
+            clip_elem,
+            ("CurrentEnd", "End", "EndTime"),
+            start_beats + 4.0,
+        )
+        if end_beats <= start_beats:
+            loop_end = _read_first_float(clip_elem, ("Loop/LoopEnd", "LoopEnd"), start_beats + 4.0)
+            end_beats = max(start_beats + 0.25, loop_end)
+
+        file_path = None
+        file_ref = clip_elem.find(".//SampleRef/FileRef")
+        if file_ref is None:
+            file_ref = clip_elem.find(".//SourceProxy/SampleRef/FileRef")
+        if file_ref is not None:
+            file_path = _read_file_ref(file_ref, als_path=als_path)
+
+        clips.append(
+            DawClip(
+                name=name,
+                start_time=round(start_beats * beat_sec, 6),
+                end_time=round(end_beats * beat_sec, 6),
+                track_index=track_index,
+                loop_start=_read_optional_beats(clip_elem, ("Loop/LoopStart", "LoopStart"), beat_sec),
+                loop_end=_read_optional_beats(clip_elem, ("Loop/LoopEnd", "LoopEnd"), beat_sec),
+                file_path=file_path,
+                midi_notes=_parse_midi_notes(clip_elem, beat_sec) if clip_elem.tag == "MidiClip" else None,
+            )
+        )
+    return clips
+
+
+def _parse_midi_notes(clip_elem, beat_sec: float) -> list[dict] | None:
+    notes: list[dict] = []
+    for key_track in clip_elem.findall(".//KeyTrack"):
+        midi_key = _read_float_attr(key_track, "MidiKey", math.nan)
+        if math.isnan(midi_key):
+            midi_key = _read_first_float(key_track, ("MidiKey",), math.nan)
+        for note_event in key_track.findall(".//MidiNoteEvent"):
+            start = _read_float_attr(note_event, "Time", _read_first_float(note_event, ("Time",), 0.0))
+            duration = _read_float_attr(note_event, "Duration", _read_first_float(note_event, ("Duration",), 0.25))
+            velocity = _read_float_attr(note_event, "Velocity", _read_first_float(note_event, ("Velocity",), 100.0))
+            notes.append(
+                {
+                    "midi": int(midi_key),
+                    "startSec": round(start * beat_sec, 6),
+                    "durationSec": round(max(0.01, duration * beat_sec), 6),
+                    "velocity": max(0.0, min(1.0, velocity / 127.0)),
+                }
+            )
+    return notes or None
+
+
+def _read_first_float(elem, paths: tuple[str, ...], default: float) -> float:
+    for path in paths:
+        found = elem.find(path)
+        value = _read_float(found, math.nan)
+        if not math.isnan(value):
+            return value
+    return default
+
+
+def _read_float_attr(elem, attr: str, default: float) -> float:
+    try:
+        return float(elem.get(attr, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _read_optional_beats(elem, paths: tuple[str, ...], beat_sec: float) -> float | None:
+    value = _read_first_float(elem, paths, math.nan)
+    if math.isnan(value):
+        return None
+    return round(value * beat_sec, 6)
 
 
 def _read_float(elem, default: float) -> float:
