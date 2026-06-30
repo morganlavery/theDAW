@@ -66,7 +66,12 @@ export const ensureEngine = (): EngineHandles => {
   const Ctor =
     (window.AudioContext ||
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext);
-  const ctx = new Ctor();
+  let ctx: AudioContext;
+  try {
+    ctx = new Ctor({ latencyHint: 'interactive' });
+  } catch {
+    ctx = new Ctor();
+  }
   const master = ctx.createGain();
   master.gain.value = 1;
   const analyser = ctx.createAnalyser();
@@ -375,4 +380,3 @@ export const samplePeakAndRMS = (): { peakDb: number; rmsDb: number; peak: numbe
   const rmsDb = rms > 0 ? 20 * Math.log10(rms) : -Infinity;
   return { peakDb, rmsDb, peak, rms };
 };
-

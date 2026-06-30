@@ -30,6 +30,13 @@ function getRepoRoot(): string {
 
 const repoRoot = getRepoRoot()
 
+// Desktop performance: ask Chromium for a small output buffer so Web Audio
+// sources (DJ decks, session clips, sampler pads) reach the audio device with
+// less buffering. Users can raise this if a particular interface crackles.
+const audioBufferSize = process.env.THEDAW_AUDIO_BUFFER_SIZE ?? '128'
+app.commandLine.appendSwitch('audio-buffer-size', audioBufferSize)
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
 // ---------------------------------------------------------------------------
 // Logging
 // ---------------------------------------------------------------------------
@@ -397,6 +404,7 @@ function createWindow(): void {
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       sandbox: true,
+      backgroundThrottling: false,
       // The boot cinematic's logo is a muted, looping video — allow it to
       // autoplay without a user gesture (Chromium blocks this by default).
       autoplayPolicy: 'no-user-gesture-required',

@@ -10,16 +10,18 @@ import {
 } from 'lucide-react';
 import { dawImportAudioUrl } from '../../lib/dawImportClient';
 import type { DawClip, DawProject, DawTrack } from '../../lib/dawImportClient';
+import { getEngineCtx, getMasterGain } from '../../state/playerStore';
 
 type ClipLookup = Map<string, DawClip>;
 
 interface SessionPlayer {
-  audio: HTMLAudioElement;
-  source?: MediaElementAudioSourceNode;
+  source: AudioBufferSourceNode;
   analyser?: AnalyserNode;
   gain?: GainNode;
   trackIndex: number;
 }
+
+type ClipBufferCache = Map<string, Promise<AudioBuffer>>;
 
 const CLIP_COLORS = [
   {
@@ -80,11 +82,8 @@ const meterHeight = (level: number): string => `${Math.round(Math.min(1, Math.ma
 
 const stopSessionPlayers = (players: SessionPlayer[]) => {
   players.forEach((player) => {
-    player.audio.pause();
-    player.audio.currentTime = 0;
-    player.audio.removeAttribute('src');
-    player.audio.load();
-    player.source?.disconnect();
+    try { player.source.onended = null; player.source.stop(); } catch { /* already stopped */ }
+    try { player.source.disconnect(); } catch { /* already disconnected */ }
     player.analyser?.disconnect();
     player.gain?.disconnect();
   });
@@ -103,7 +102,8 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
   const [masterLevel, setMasterLevel] = React.useState(0);
   const [elapsedSeconds, setElapsedSeconds] = React.useState(0);
   const playersRef = React.useRef<SessionPlayer[]>([]);
-  const audioContextRef = React.useRef<AudioContext | null>(null);
+  const bufferCacheRef = React.useRef<ClipBufferCache>(new Map());
+  const launchTokenRef = React.useRef(0);
   const animationRef = React.useRef<number | null>(null);
   const startedAtRef = React.useRef<number | null>(null);
   const meterDataRef = React.useRef(new Uint8Array(0));
@@ -174,6 +174,39 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     [clipLookup, tracks],
   );
 
+  const getClipBuffer = React.useCallback((filePath: string): Promise<AudioBuffer> => {
+    const url = dawImportAudioUrl(filePath);
+    const cached = bufferCacheRef.current.get(url);
+    if (cached) return cached;
+    const task = (async () => {
+      const context = getEngineCtx();
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`clip fetch ${response.status}`);
+      return context.decodeAudioData(await response.arrayBuffer());
+    })();
+    bufferCacheRef.current.set(url, task);
+    task.catch(() => bufferCacheRef.current.delete(url));
+    return task;
+  }, []);
+
+  React.useEffect(() => {
+    let cancelled = false;
+    const filePaths = Array.from(
+      new Set(
+        tracks
+          .flatMap((track) => track.clips.map((clip) => clip.file_path))
+          .filter((filePath): filePath is string => !!filePath),
+      ),
+    );
+    const warm = async () => {
+      for (let index = 0; index < filePaths.length && !cancelled; index += 2) {
+        await Promise.allSettled(filePaths.slice(index, index + 2).map(getClipBuffer));
+      }
+    };
+    if (filePaths.length > 0) void warm();
+    return () => { cancelled = true; };
+  }, [getClipBuffer, tracks]);
+
   const tickMeters = React.useCallback(() => {
     const players = playersRef.current;
     const next = Array.from({ length: tracks.length }, () => 0);
@@ -201,56 +234,49 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
     animationRef.current = window.requestAnimationFrame(tickMeters);
   }, [tracks.length]);
 
-  const ensureAudioContext = React.useCallback(() => {
-    const AudioContextCtor =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!audioContextRef.current && AudioContextCtor) {
-      audioContextRef.current = new AudioContextCtor();
-    }
-    return audioContextRef.current;
-  }, []);
-
   const launchScene = React.useCallback(
-    (sceneIndex: number) => {
+    async (sceneIndex: number) => {
+      const launchToken = launchTokenRef.current + 1;
+      launchTokenRef.current = launchToken;
       stopScene();
       setLaunchError(null);
       setLastScene(sceneIndex);
       const clips = sceneClips(sceneIndex);
-      const context = ensureAudioContext();
-      const nextPlayers = clips.map(({ clip, track, trackIndex }) => {
-        const audio = new Audio(dawImportAudioUrl(clip.file_path ?? ''));
-        audio.preload = 'auto';
-        audio.volume = dbToVolume(track.volume_db);
-        const sessionPlayer: SessionPlayer = { audio, trackIndex };
-        if (context) {
-          const source = context.createMediaElementSource(audio);
+      const context = getEngineCtx();
+      try {
+        if (context.state === 'suspended') await context.resume();
+        const decoded = await Promise.all(clips.map(async ({ clip, track, trackIndex }) => ({
+          buffer: await getClipBuffer(clip.file_path ?? ''),
+          track,
+          trackIndex,
+        })));
+        if (launchTokenRef.current !== launchToken) return;
+        const startAt = context.currentTime + 0.01;
+        const nextPlayers = decoded.map(({ buffer, track, trackIndex }) => {
+          const source = context.createBufferSource();
           const gain = context.createGain();
           const analyser = context.createAnalyser();
+          source.buffer = buffer;
           analyser.fftSize = 512;
           analyser.smoothingTimeConstant = 0.62;
           gain.gain.value = dbToVolume(track.volume_db);
           source.connect(gain);
           gain.connect(analyser);
-          analyser.connect(context.destination);
-          sessionPlayer.source = source;
-          sessionPlayer.gain = gain;
-          sessionPlayer.analyser = analyser;
-        }
-        return sessionPlayer;
-      });
-      playersRef.current = nextPlayers;
-      setActiveScene(sceneIndex);
-      startedAtRef.current = performance.now();
-      if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
-      void context?.resume();
-      void Promise.allSettled(nextPlayers.map((player) => player.audio.play())).then((results) => {
-        if (results.some((result) => result.status === 'rejected')) {
+          analyser.connect(getMasterGain());
+          source.start(startAt);
+          return { source, gain, analyser, trackIndex };
+        });
+        playersRef.current = nextPlayers;
+        setActiveScene(sceneIndex);
+        startedAtRef.current = performance.now();
+        if (animationRef.current == null) animationRef.current = window.requestAnimationFrame(tickMeters);
+      } catch {
+        if (launchTokenRef.current === launchToken) {
           setLaunchError('Some clips could not be played.');
         }
-      });
+      }
     },
-    [ensureAudioContext, sceneClips, stopScene, tickMeters],
+    [getClipBuffer, sceneClips, stopScene, tickMeters],
   );
 
   const launchPreviousScene = () => {
@@ -286,7 +312,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
         <div className="ml-auto flex items-center gap-1">
           <button
             type="button"
-            onClick={launchPreviousScene}
+            onClick={() => void launchPreviousScene()}
             className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
             aria-label="Launch previous scene"
             title="Previous scene"
@@ -295,7 +321,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           </button>
           <button
             type="button"
-            onClick={() => launchScene(activeScene ?? lastScene)}
+            onClick={() => void launchScene(activeScene ?? lastScene)}
             className="h-7 w-8 grid place-items-center border border-emerald-900/70 bg-[#113525] text-emerald-300 hover:bg-[#185239]"
             aria-label="Play session"
             title="Play selected scene"
@@ -321,7 +347,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
           </button>
           <button
             type="button"
-            onClick={launchNextScene}
+            onClick={() => void launchNextScene()}
             className="h-7 w-7 grid place-items-center border border-black/50 bg-[#15171b] text-zinc-300 hover:bg-[#3a3d45] hover:text-white"
             aria-label="Launch next scene"
             title="Next scene"
@@ -371,7 +397,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
               <React.Fragment key={`${sceneName}-${sceneIndex}`}>
                 <button
                   type="button"
-                  onClick={() => launchScene(sceneIndex)}
+                  onClick={() => void launchScene(sceneIndex)}
                   disabled={!hasClips}
                   className={[
                     'sticky left-0 z-10 min-h-7 border-r-2 border-b border-black/70 px-1.5 text-left',
@@ -401,7 +427,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
                       {clip ? (
                         <button
                           type="button"
-                          onClick={() => launchScene(sceneIndex)}
+                          onClick={() => void launchScene(sceneIndex)}
                           disabled={!clip.file_path}
                           className={[
                             'h-7 w-full px-1.5 flex items-center gap-1 border text-left',
@@ -421,7 +447,7 @@ export const DawSessionGrid: React.FC<DawSessionGridProps> = ({ project, fill = 
                 })}
                 <button
                   type="button"
-                  onClick={() => launchScene(sceneIndex)}
+                  onClick={() => void launchScene(sceneIndex)}
                   disabled={!hasClips}
                   className={[
                     'min-h-7 border-b border-black/70 px-1.5 flex items-center gap-1 text-black',

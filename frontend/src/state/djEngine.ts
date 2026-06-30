@@ -506,9 +506,17 @@ export function playDeck(id: DeckId, opts: { spinUp?: boolean } = {}): void {
   const d = decks[id];
   if (!d || (!d.buffer && !d.stemMode) || d.playing) return;
   const ctx = getEngineCtx();
-  if (ctx.state === 'suspended') void ctx.resume().catch(() => { /* retry next gesture */ });
-  startSource(d, d.startOffset, opts.spinUp);
-  emit();
+  const start = () => {
+    const liveDeck = decks[id];
+    if (!liveDeck || (!liveDeck.buffer && !liveDeck.stemMode) || liveDeck.playing) return;
+    startSource(liveDeck, liveDeck.startOffset, opts.spinUp);
+    emit();
+  };
+  if (ctx.state === 'suspended') {
+    void ctx.resume().then(start).catch(() => { /* retry next gesture */ });
+    return;
+  }
+  start();
 }
 
 export function pauseDeck(id: DeckId): void {
