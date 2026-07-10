@@ -37,9 +37,10 @@ _auto_spawn_lock = threading.Lock()
 
 
 def _maybe_auto_spawn() -> None:
-    """Kick off ensure_running() in a background thread once. Called
-    on the first /status / /url request so the heavy npm-install on
-    first run doesn't block the request thread."""
+    """Kick off background readiness once. In static mode (a bundled build is
+    served by the backend) this refreshes a dev checkout's dist if stale but
+    starts no Node process. Otherwise it spawns the Vite dev/preview server so
+    the heavy first-run npm work doesn't block the request thread."""
     global _auto_spawn_started
     if os.environ.get("theDAW_VJ_NO_AUTO_SPAWN"):
         return
@@ -48,14 +49,22 @@ def _maybe_auto_spawn() -> None:
             return
         _auto_spawn_started = True
 
-    def _spawn() -> None:
-        try:
-            url = sidecar.ensure_running()
-            log.info("vj.router: auto-spawn ready at %s", url)
-        except Exception as e:  # noqa: BLE001 — log and swallow
-            log.warning("vj.router: auto-spawn failed: %s", e)
+    # Key off the ACTUAL mount, not is_static_mode(): a dist that appears
+    # mid-session flips is_static_mode() true while no /vj-app mount exists.
+    static = sidecar.static_mount_active()
 
-    threading.Thread(target=_spawn, daemon=True, name="vj-auto-spawn").start()
+    def _warm() -> None:
+        try:
+            if static:
+                dist = sidecar.ensure_static_dist()
+                log.info("vj.router: static build ready at %s", dist)
+            else:
+                url = sidecar.ensure_running()
+                log.info("vj.router: auto-spawn ready at %s", url)
+        except Exception as e:  # noqa: BLE001 — log and swallow
+            log.warning("vj.router: warm-up failed: %s", e)
+
+    threading.Thread(target=_warm, daemon=True, name="vj-warm").start()
 
 
 @router.get("/url")
@@ -68,6 +77,19 @@ def get_url() -> dict:
     the machine has no non-loopback IP) so the frontend can render a QR
     code / shareable link for phones on the same Wi-Fi."""
     _maybe_auto_spawn()
+    # Static mode: the backend serves the build at STATIC_MOUNT_PATH on its own
+    # origin. Return the relative path ONLY when the mount really exists
+    # (static_mount_active) — is_static_mode() can flip true mid-session when
+    # a dist gets built, but the mount is registered once at boot, and a
+    # mountless /vj-app/ URL 404s in the iframe. The frontend composes the
+    # phone URL from lan_ip + its own port, so mobile_url is left null here.
+    if sidecar.static_mount_active():
+        return {
+            "url": f"{sidecar.STATIC_MOUNT_PATH}/",
+            "mode": "static",
+            "mobile_url": None,
+            "lan_ip": sidecar.detect_lan_ip(),
+        }
     try:
         url = sidecar.ensure_running()
     except RuntimeError as e:
@@ -75,6 +97,7 @@ def get_url() -> dict:
     cfg = sidecar.resolve_config()
     return {
         "url": url,
+        "mode": "dev",
         "mobile_url": sidecar.mobile_url_for(cfg.port),
         "lan_ip": sidecar.detect_lan_ip(),
     }

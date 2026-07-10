@@ -7,7 +7,7 @@
  * the caller supplies the chain array and the mutators.
  */
 
-import { ChevronUp, ChevronDown, X } from 'lucide-react';
+import { Blocks, ChevronUp, ChevronDown, SlidersHorizontal, X } from 'lucide-react';
 import { RACK_EFFECTS, getRackEffect } from '../../lib/rackEffects';
 import type { ChainEntry } from '../../state/effectChainStore';
 import { SlideTrack } from './SlideTrack';
@@ -31,6 +31,16 @@ interface FxRackProps {
    *  at the current playhead, so a control's displayed value follows its lane.
    *  Display-only: edits still write the stored params. */
   displayParams?: (entryId: string) => Record<string, number> | undefined;
+  /** Hide the built-in "+ Add effect" select (the caller supplies its own add UI,
+   *  e.g. DRAW's colored effect palette). The chain rows still render. */
+  hideAdd?: boolean;
+  /** When provided, VST entries get a GUI-open button that (re)opens the
+   *  plugin's native editor (teal once a captured raw_state is stored). Absent
+   *  (e.g. DRAW), VST tiles stay inert exactly as before. */
+  onOpenVst?: (entry: ChainEntry) => void;
+  /** When provided, the 'ares' composite entry gets an open-surface button
+   *  that opens its .gan control surface. */
+  onOpenSurface?: (entry: ChainEntry) => void;
 }
 
 const fmtValue = (v: number, step: number, unit?: string): string => {
@@ -48,40 +58,86 @@ export function FxRack({
   onUpdateParams,
   projectBpm,
   displayParams,
+  hideAdd,
+  onOpenVst,
+  onOpenSurface,
 }: FxRackProps) {
   const addId = `${idPrefix}-add`;
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="flex items-center gap-2">
-        <label htmlFor={addId} className="sr-only">Add insert effect</label>
-        <select
-          id={addId}
-          name={addId}
-          value=""
-          onChange={(e) => {
-            if (e.target.value) onAdd(e.target.value);
-          }}
-          className="bg-zinc-900 border border-white/20 rounded px-2 py-1 text-[11px] font-mono text-zinc-100 outline-none focus:border-purple-500/60 transition-colors cursor-pointer"
-          style={{ colorScheme: 'dark' }}
-          title="Add a psychoacoustic insert effect to this chain"
-        >
-          <option value="">+ Add effect…</option>
-          {RACK_EFFECTS.map((d) => (
-            <option key={d.id} value={d.id}>{d.label}</option>
-          ))}
-        </select>
-        {chain.length === 0 && (
-          <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider">no inserts</span>
-        )}
-      </div>
+      {!hideAdd && (
+        <div className="flex items-center gap-2">
+          <label htmlFor={addId} className="sr-only">Add insert effect</label>
+          <select
+            id={addId}
+            name={addId}
+            value=""
+            onChange={(e) => {
+              if (e.target.value) onAdd(e.target.value);
+            }}
+            className="form-select px-2 py-1 text-[11px] font-mono"
+            style={{ colorScheme: 'dark' }}
+            title="Add a psychoacoustic insert effect to this chain"
+          >
+            <option value="">+ Add effect…</option>
+            {RACK_EFFECTS.map((d) => (
+              <option key={d.id} value={d.id}>{d.label}</option>
+            ))}
+          </select>
+          {chain.length === 0 && (
+            <span className="text-[9px] font-mono text-zinc-600 uppercase tracking-wider">no inserts</span>
+          )}
+        </div>
+      )}
 
       {/* Effects tile and wrap (capped width) so they use horizontal space
           instead of one full-width column of stretched sliders. */}
       <div className="flex flex-wrap gap-2 items-start">
       {chain.map((entry, i) => {
         const def = getRackEffect(entry.effect);
-        if (!def) return null;
+        // Entries with no live rack definition are imported VST3 plugins or a
+        // source-DAW effect theDAW preserves but can't render live per-track.
+        // Show them as a labelled, inert tile (toggle/remove) so nothing is
+        // hidden; they stay out of the live audio graph (buildEffectChain skips
+        // anything not in the rack).
+        if (!def) {
+          const label = entry.vst?.plugin_name || entry.label || entry.effect;
+          return (
+            <div
+              key={entry.id}
+              className="grow basis-60 max-w-xs rounded border border-white/5 bg-black/30 p-2 flex items-center gap-1.5 opacity-60"
+            >
+              <span className="text-[8px] font-black uppercase tracking-wider text-amber-300/80 shrink-0">
+                {entry.effect === 'vst3' ? 'VST' : 'IMP'}
+              </span>
+              <span
+                className="text-[10px] font-mono text-zinc-300 flex-1 truncate"
+                title={`${label} — preserved from import (not rendered live on this track yet)`}
+              >
+                {label}
+              </span>
+              {entry.vst && onOpenVst && (
+                <button
+                  onClick={() => onOpenVst(entry)}
+                  aria-label={`Open ${label} plugin GUI`}
+                  title={entry.vst.raw_state ? 'Edit plugin GUI (custom settings saved)' : "Open the plugin's native GUI"}
+                  className={`p-0.5 rounded hover:bg-white/5 shrink-0 ${entry.vst.raw_state ? 'text-teal-400 hover:text-teal-300' : 'text-zinc-500 hover:text-teal-300'}`}
+                >
+                  <SlidersHorizontal className="w-3 h-3" />
+                </button>
+              )}
+              <button
+                onClick={() => onRemove(entry.id)}
+                aria-label={`Remove ${label}`}
+                title="Remove this imported effect"
+                className="p-0.5 rounded text-zinc-500 hover:text-red-400 hover:bg-red-500/10 shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          );
+        }
         // While a lane plays back, show the sampled value so the control follows
         // the automation; edits still write the stored params (onUpdateParams).
         const shown = displayParams ? { ...entry.params, ...(displayParams(entry.id) ?? {}) } : entry.params;
@@ -102,6 +158,16 @@ export function FxRack({
               <span className="text-[10px] font-mono text-zinc-200 flex-1 truncate" title={def.description}>
                 {def.label}
               </span>
+              {entry.effect === 'ares' && onOpenSurface && (
+                <button
+                  onClick={() => onOpenSurface(entry)}
+                  aria-label="Open the Ares control surface"
+                  title="Open the Ares control surface"
+                  className="p-0.5 rounded text-zinc-500 hover:text-indigo-300 hover:bg-white/5 shrink-0"
+                >
+                  <Blocks className="w-3 h-3" />
+                </button>
+              )}
               <button
                 onClick={() => onReorder(i, i - 1)}
                 disabled={i === 0}

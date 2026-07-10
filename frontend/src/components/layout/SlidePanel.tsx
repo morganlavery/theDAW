@@ -45,6 +45,7 @@ import {
   profileKindCount,
   detectProfileFromNames,
   GANTASMO_WORLDS_COLLIDE_ID,
+  AUDIMA_SWAY_ID,
   type ControlKind,
 } from '../../state/controllerProfiles';
 import { useEditorStore } from '../../state/editorStore';
@@ -961,6 +962,13 @@ export const SlidePanel: React.FC = () => {
               <option value={p.id}>{p.name} · {profileControlCount(p)}</option>
             </optgroup>
           ))}
+          {/* Audima Sway — pinned second so the 6-dimension motion surface sits
+              one click below the GANTASMO twin. */}
+          {CONTROLLER_PROFILES.filter((p) => p.id === AUDIMA_SWAY_ID).map((p) => (
+            <optgroup key="sway" label="SWAY">
+              <option value={p.id}>{p.name} · {profileControlCount(p)}</option>
+            </optgroup>
+          ))}
           {learnedProfiles.length > 0 && (
             <optgroup label="LEARNED (your devices)">
               {learnedProfiles
@@ -973,7 +981,7 @@ export const SlidePanel: React.FC = () => {
           )}
           {(['dj', 'pad', 'mixer', 'keys', 'generic'] as const).map((cat) => {
             const inCat = CONTROLLER_PROFILES
-              .filter((p) => (p.category ?? 'generic') === cat && p.id !== GANTASMO_WORLDS_COLLIDE_ID)
+              .filter((p) => (p.category ?? 'generic') === cat && p.id !== GANTASMO_WORLDS_COLLIDE_ID && p.id !== AUDIMA_SWAY_ID)
               .sort((a, b) => a.name.localeCompare(b.name)); // alpha within each group
             if (inCat.length === 0) return null;
             return (
@@ -1370,8 +1378,17 @@ const ControllerView: React.FC<{
           const { item, locked } = resolve(index);
           const binding = bindings?.[pos];
           const learning = learnPos === pos;
+          const slotLabel = sec.labels?.[i];
           cells.push(
             <div className="sl-mapcell" key={index}>
+              {slotLabel && (
+                <div
+                  className="text-[7px] font-mono uppercase tracking-tight text-zinc-400 text-center truncate"
+                  title={slotLabel}
+                >
+                  {slotLabel}
+                </div>
+              )}
               <Slot
                 index={index}
                 kind={sec.kind}
@@ -1403,7 +1420,7 @@ const ControllerView: React.FC<{
         }
         return (
           <div className="sl-section" key={sec.id}>
-            <div className="sl-section-head">{sec.label} · {sec.rows}×{sec.cols}</div>
+            <div className="sl-section-head">{sec.label}{sec.labels ? '' : ` · ${sec.rows}×${sec.cols}`}</div>
             <div className="sl-grid" style={{ gridTemplateColumns: `repeat(${sec.cols}, var(--lane))` }}>
               {cells}
             </div>

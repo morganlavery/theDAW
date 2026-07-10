@@ -4,21 +4,52 @@ codegraph/
 
 # Secrets & user data
 data/api_key_pools.json
+# TOUR third-party keys (ORS, OpenChargeMap), saved filter preset, provider cache
+data/tour_keys.json
+data/tour_filters.json
+data/tour_cache/
+# Underfit upstream-update check cache (written by backend/modules/underfit/updater.py)
+data/underfit_update.json
+# App update check cache (written by backend/modules/updates/router.py)
+data/updates_check.json
+# Quest deploy config: adb path override, last APK, default package (user-local)
+data/quest.json
+# Quest deploy APK downloads pulled from theDAW-XR releases (~150 MB each)
+data/quest/
 data/generations/
 data/settings.json
+data/recent_projects.json
 data/local_checkpoints.json
 data/library.db
 data/library.db-*
 # Suno cloud-gen key/jobs + local session change logs (never committed)
 data/suno_api_key.json
 data/suno_jobs.json
+# Installed/built .gan plugins + their extracted runtime (regenerated on demand)
+data/plugins/
+# Machine-specific VST3 scan cache (regenerated on scan)
+backend/modules/vst/vst3_scan_cache.json
+# Captured VST3 native-editor state (per-plugin presets, machine-specific)
+data/vst_presets/
 CHANGES-LOGS/
 backend/rag_index/
 archive/
+# Generated git-history visualisation (scripts/gen_git_graph.py) — a local artifact
+docs/git-history.html
 *.png
 !docs/UI/**/*.png
 !docs/guides/**/*.png
 !docs/readme/**/*.png
+# Bundled .gan plugin artwork (The Owl) — a required runtime asset, not a capture still
+!frontend/public/owl/*.png
+# Bundled .gan plugin artwork (Ares) — the VST Foundry export's background.png beside
+# its project.json; required to package ares.gan (without it the surface has no background)
+!backend/modules/plugin/assets/**/*.png
+# The desktop app icon — electron-builder's buildResources auto-discovers it and
+# converts to .ico/.icns. It MUST be tracked: a fresh CI checkout otherwise builds
+# installers with the default Electron icon (local builds mask this because the
+# file exists untracked on the dev machine).
+!electron-ui/resources/icon.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -43,7 +74,14 @@ eggs/
 /parts/
 /sdist/
 /var/
-/wheels/
+# Ignore build-artifact wheels, but TRACK the vendored prebuilt aubio wheels:
+# aubio is source-only on PyPI, so these bundled per-platform wheels (pinned in
+# pyproject [tool.uv.sources], built by .github/workflows/build-aubio-wheels.yml)
+# are what let a compiler-less Windows / macOS / Linux box install aubio.
+/wheels/*
+!/wheels/aubio-0.4.9-cp310-cp310-win_amd64.whl
+!/wheels/aubio-0.4.9-cp310-cp310-macosx_11_0_arm64.whl
+!/wheels/aubio-0.4.9-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
 share/python-wheels/
 *.egg-info/
 .installed.cfg
@@ -149,8 +187,15 @@ celerybeat.pid
 env/
 venv/
 ENV/
+
+# uv package cache kept on the repo's drive so wheels hardlink into .venv
+# (set by theDAW.bat / install/setup.ps1). Runtime-only, can be multi-GB.
+.uv-cache/
 env.bak/
 venv.bak/
+
+# Isolated runtime venv + filtered reqs for the faster-whisper transcription sidecar
+backend/modules/vocal/transcription/.whisper_venv/
 
 # Spyder project settings
 .spyderproject
@@ -218,6 +263,7 @@ docs/*.pdf
 
 # Local archive of superseded/scratch files (see archive/README.md) — not tracked
 /archive/
+/research/
 .vite/
 .orb_attachments/
 
@@ -227,6 +273,9 @@ docs/*.pdf
 
 # Session changelogs — local dev notes, not version-controlled
 /docs/changes/
+
+# Session/branch reports — local working notes, not version-controlled
+/docs/reports/
 
 # Loose capture stills & scratch media at repo root (mirror the *.png policy so
 # ad-hoc .jpeg screenshots like shot01_*.jpeg never get committed). Anchored to
@@ -249,12 +298,63 @@ docs/*.pdf
 /_*.py
 /*.mp3
 /dna-polyphonic-splice*.html
+/temp-tools/doc-audit-*/
+/temp-tools/doc-audit-manifest.json
 
 # Local audit artifacts: vulnerability details stay off the remote.
 /CODEBASE_AUDIT_*.md
 /audit-reports/
 
+# Internal working-notes and status docs — local only, not user documentation.
+# Kept out of the tracked tree and the installer.
+/docs/plans/
+/docs/audits/
+/docs/changes/
+/docs/in-flight-work.md
+/docs/WHERE-WE-STAND.md
+/docs/TASMO-VST-DAW-IMPORT-ROADMAP.md
+/docs/DESIGN_PRINCIPLES.md
+/docs/DESIGN_WIREFRAME.svg
+
 # Electron desktop shell — build artifacts + runtime logs (deps via node_modules/ above)
 electron-ui/out/
 electron-ui/release/
+# Bundled runtime binaries fetched at build time (uv.exe, ffmpeg.exe) — large,
+# downloaded from official sources by scripts/fetch-runtime-tools.mjs.
+electron-ui/resources/tools/
+# Staged VJ production build (gantasmo/VJ-9000 dist), regenerated at package
+# time by scripts/fetch-vj-build.mjs.
+electron-ui/resources/vj-dist/
+# Staged VST Foundry production bundle (dist/ + prod node_modules), regenerated
+# at package time by scripts/fetch-foundry-build.mjs.
+electron-ui/resources/foundry-app/
 logs/
+
+# Editing/backup cruft (e.g. vendored apps' *.bak-<date> files)
+*.bak
+*.bak-*
+deprecated/
+
+# Local model weights (multi-GB safetensors + configs) - never commit
+models/
+
+# Underfit is vendored as a git-subrepo (dada-bots/underfit + local mods): its
+# CODE is tracked by theDAW; only its heavy runtime dirs are excluded here (also
+# covered by underfit/.gitignore). state/ is multi-GB — never commit it.
+/underfit/state/
+/underfit/.venv/
+/underfit/.gradio/
+/underfit/**/node_modules/
+/underfit/**/__pycache__/
+
+# Stems sidecar (integration-package/backend) runtime artifacts.
+# Only the sidecar's code is committed; its venv, logs, results, and the
+# LARSNET weights are created or placed at runtime.
+integration-package/backend/.sidecar_venv/
+integration-package/backend/.sidecar_logs/
+integration-package/backend/.sidecar_venv_requirements.txt
+integration-package/backend/backend_port.txt
+integration-package/backend/logs/
+integration-package/backend/results/
+integration-package/backend/larsnet/pretrained_larsnet_models/
+integration-package/backend/larsnet/pretrained_larsnet_models.zip

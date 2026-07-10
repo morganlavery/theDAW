@@ -4,13 +4,13 @@ import {
   Scissors, Mic2, Search, ChevronDown,
   LayoutList, AudioWaveform, Volume2, Sliders,
   Wand2, Loader2, BookOpen, Layers, Sparkles, Download,
-  Music2, Dice5, Repeat,
+  Music2, Dice5, Repeat, Aperture,
 } from 'lucide-react';
 import { useGenerateParamsStore, type GenerateParamsState } from '../state/generateParamsStore';
 import { useGenerateStore } from '../state/generateStore';
 import { useLibraryStore } from '../state/libraryStore';
 import { useEditorStore } from '../state/editorStore';
-import { WaveformPreview } from '../components/audio/WaveformPreview';
+import { SemanticWave } from '../components/audio/SemanticWave';
 import { FooterScrubWave } from '../components/audio/FooterScrubWave';
 import { LibraryMidiPicker, type PickerAnchor } from '../components/audio/LibraryMidiPicker';
 import { renderMidiBufferToBlob } from '../lib/midiSynth';
@@ -356,18 +356,84 @@ export const AdvancedGenPanel: React.FC<{
   const [spectrograms, setSpectrograms] = useState<{mel:string,stft:string,chromagram:string,cqt:string}|null>(null);
   const [specLoading, setSpecLoading] = useState(false);
 
-  // Center hero tab — Chimera (setup) ↔ Compare (post-gen inspection).
-  const [heroTab, setHeroTab] = useState<'chimera' | 'compare'>('chimera');
+  // Center hero tab — Chimera (setup) ↔ Compare (post-gen inspection) ↔
+  // Synesteez (image → spectrogram audio composer).
+  const [heroTab, setHeroTab] = useState<'chimera' | 'compare' | 'synesteez'>('chimera');
   const prevAudioRef = useRef<string | null>(null);
   useEffect(() => {
     if (lastAudioUrl && lastAudioUrl !== prevAudioRef.current) setHeroTab('compare');
     prevAudioRef.current = lastAudioUrl;
   }, [lastAudioUrl]);
 
+  // Synesteez host bridge — the iframe posts finished WAV blobs; import them
+  // into the library, load them on the master footer transport, and mirror
+  // player state back so the iframe's Play buttons can show Play/Pause.
+  const synesteezFrameRef = useRef<HTMLIFrameElement>(null);
+  useEffect(() => {
+    if (heroTab !== 'synesteez') return;
+    const post = (msg: Record<string, unknown>) => {
+      synesteezFrameRef.current?.contentWindow?.postMessage(msg, window.location.origin);
+    };
+    const onMsg = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if (!synesteezFrameRef.current || e.source !== synesteezFrameRef.current.contentWindow) return;
+      const d = e.data as { type?: string; name?: string; blob?: Blob; duration?: number; entryId?: string };
+      if (d?.type === 'synesteez:output' && d.blob instanceof Blob) {
+        const { blob } = d;
+        void (async () => {
+          try {
+            const entry = await useLibraryStore.getState().importEntry({
+              blob,
+              filename: `${d.name ?? 'synesteez'}.wav`,
+              mimeType: 'audio/wav',
+              metadata: {
+                title: d.name ?? 'Synesteez output',
+                model: 'synesteez',
+                duration: d.duration,
+                source: 'studio',
+                tags: ['synesteez'],
+              },
+            });
+            await usePlayerStore.getState().load(blob, { label: entry.title, entryId: entry.id });
+            post({ type: 'synesteez:saved', ok: true, entryId: entry.id, title: entry.title });
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            logError('synesteez', `Library save failed: ${msg}`);
+            post({ type: 'synesteez:saved', ok: false, error: msg });
+          }
+        })();
+      } else if (d?.type === 'synesteez:play' && d.entryId) {
+        void (async () => {
+          const player = usePlayerStore.getState();
+          if (player.currentEntryId === d.entryId) { player.toggle(); return; }
+          const lib = useLibraryStore.getState();
+          const entry = lib.entries.find((en) => en.id === d.entryId);
+          if (!entry) return;
+          try {
+            const blob = await lib.fetchAudioBlob(entry);
+            await usePlayerStore.getState().load(blob, { label: entry.title, entryId: entry.id });
+            usePlayerStore.getState().play();
+          } catch (err) {
+            logError('synesteez', `Playback load failed: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        })();
+      }
+    };
+    window.addEventListener('message', onMsg);
+    const unsub = usePlayerStore.subscribe((s, prev) => {
+      if (s.isPlaying === prev.isPlaying && s.currentEntryId === prev.currentEntryId) return;
+      post({ type: 'synesteez:player', isPlaying: s.isPlaying, entryId: s.currentEntryId });
+    });
+    return () => { window.removeEventListener('message', onMsg); unsub(); };
+  }, [heroTab]);
+
   const [cmpLayers, setCmpLayers] = useState<Set<string>>(
     () => new Set(['output', 'init', 'mel', 'stft', 'chromagram', 'cqt']),
   );
   const [cmpOverlay, setCmpOverlay] = useState(false);
+  // Decoded length of the inpaint audio, so the mask band can convert its
+  // seconds-based maskStart/maskEnd to the 0..1 fractions SemanticWave expects.
+  const [inpaintDur, setInpaintDur] = useState(0);
   const toggleLayer = (k: string) => setCmpLayers((prev) => {
     const next = new Set(prev);
     if (next.has(k)) next.delete(k); else next.add(k);
@@ -567,7 +633,7 @@ export const AdvancedGenPanel: React.FC<{
               }} />
           </div>
           <div className="flex-1 min-h-0 rounded overflow-hidden border border-white/5 bg-black/40">
-            {initAudioUrl ? <WaveformPreview audioUrl={initAudioUrl} height={88} />
+            {initAudioUrl ? <SemanticWave audioUrl={initAudioUrl} height={88} ariaLabel="Init audio waveform" />
               : <div className="h-full flex items-center justify-center"><span className="text-[9px] text-zinc-600">No init audio</span></div>}
           </div>
         </div>
@@ -594,7 +660,12 @@ export const AdvancedGenPanel: React.FC<{
               onChange={(e) => { if (e.target.files?.[0]) patch({ inpaintAudioFile: e.target.files[0], inpaintEnabled: true, maskStart: 0, maskEnd: 0 }); e.target.value = ''; }} />
           </div>
           <div className="flex-1 min-h-0 rounded overflow-hidden border border-white/5 bg-black/40">
-            {inpaintAudioUrl ? <WaveformPreview audioUrl={inpaintAudioUrl} height={88} enableRegions regionStart={p.maskStart} regionEnd={p.maskEnd} onRegionChange={(s, e) => patch({ maskStart: s, maskEnd: e })} />
+            {inpaintAudioUrl ? <SemanticWave audioUrl={inpaintAudioUrl} height={88} ariaLabel="Inpaint audio waveform" onDuration={setInpaintDur}
+                region={inpaintDur > 0 ? {
+                  start: p.maskStart / inpaintDur,
+                  end: p.maskEnd / inpaintDur,
+                  onChange: (s, e) => patch({ maskStart: s * inpaintDur, maskEnd: e * inpaintDur }),
+                } : undefined} />
               : <div className="h-full flex items-center justify-center"><span className="text-[9px] text-zinc-600">No inpaint audio</span></div>}
           </div>
           </>)}
@@ -795,6 +866,9 @@ export const AdvancedGenPanel: React.FC<{
             <button onClick={() => setHeroTab('chimera')} className={`relative z-10 ${tabBtn(heroTab === 'chimera')}`}>
               <Layers className="w-3 h-3" /> Chimera
             </button>
+            <button onClick={() => setHeroTab('synesteez')} className={`relative z-10 ${tabBtn(heroTab === 'synesteez')}`}>
+              <Aperture className="w-3 h-3" /> Synesteez
+            </button>
             <button onClick={() => lastAudioUrl && setHeroTab('compare')} disabled={!lastAudioUrl}
               className={`relative z-10 ${tabBtn(heroTab === 'compare')} disabled:opacity-30 disabled:cursor-not-allowed`}>
               <AudioWaveform className="w-3 h-3" /> Compare
@@ -813,6 +887,19 @@ export const AdvancedGenPanel: React.FC<{
               <div className="flex-1 px-1 min-h-0 overflow-y-auto" data-chimera-anchor="init-audio">
                 <ChimeraStack />
               </div>
+            </div>
+          )}
+
+          {/* SYNESTEEZ tab — image → spectrogram audio composer, a self-contained
+              same-origin app vendored under /synesteez (Composer/Sequence/Meta). */}
+          {heroTab === 'synesteez' && (
+            <div className="relative z-10 flex-1 min-h-0 overflow-hidden rounded-lg border border-white/5 bg-[#0d0d0f]">
+              <iframe
+                ref={synesteezFrameRef}
+                src="/synesteez/index.html"
+                title="Synesteez — image to spectrogram audio"
+                className="w-full h-full border-0 block"
+              />
             </div>
           )}
 
@@ -847,7 +934,7 @@ export const AdvancedGenPanel: React.FC<{
                 {cmpLayers.has('init') && initAudioUrl && (
                   <div className={cmpOverlay ? 'absolute inset-0 opacity-50 mix-blend-screen pointer-events-none' : 'h-22 shrink-0'}>
                     <div className="h-full rounded overflow-hidden border border-cyan-500/20 bg-black/20">
-                      <WaveformPreview audioUrl={initAudioUrl} height={cmpOverlay ? 220 : 84} />
+                      <SemanticWave audioUrl={initAudioUrl} height={cmpOverlay ? 220 : 84} ariaLabel="Compare init waveform" />
                     </div>
                   </div>
                 )}
@@ -955,9 +1042,10 @@ export const AdvancedGenPanel: React.FC<{
             </div>
 
             {/* OUTPUT (Magenta) ↔ FX/SHIFT (SA3) — moved from the chimera card;
-                stretches to the rail bottom so there is no blank space below */}
+                mt-auto anchors it to the rail bottom so it sits level with the
+                left column's sampler faders instead of leaving a gap below */}
             {isMagenta ? (
-              <div className={`${colBox} p-2 flex flex-col gap-1 shrink-0 h-1/2`}>
+              <div className={`${colBox} p-2 flex flex-col gap-1 shrink-0 h-1/2 mt-auto`}>
                 <span className={subTitle}>OUTPUT</span>
                 <div className="flex items-start justify-around gap-1 shrink-0">
                   <RoundToggle label="Cut" icon={Scissors} on={p.cutToDuration} onChange={(v) => sf('cutToDuration', v)} />
@@ -977,7 +1065,7 @@ export const AdvancedGenPanel: React.FC<{
                 </div>
               </div>
             ) : (
-              <div className={`${colBox} p-2 flex flex-col gap-1 shrink-0 h-1/2`}>
+              <div className={`${colBox} p-2 flex flex-col gap-1 shrink-0 h-1/2 mt-auto`}>
                 <span className={subTitle}>FX</span>
                 <div className="flex items-start justify-around gap-1 shrink-0">
                   <SlideKnob label="Norm thr" value={p.cfgNormThreshold} onChange={(v) => sf('cfgNormThreshold', v)} min={0} max={100} step={0.1} tipKey="cfgNormThreshold" size={46} centerReadout />

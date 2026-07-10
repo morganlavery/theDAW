@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
-import { Settings, BookOpen, Smartphone, X, Copy, ExternalLink, ChevronUp, ChevronDown, GripHorizontal, ChevronRight, ChevronLeft, Library } from 'lucide-react';
+import { BookOpen, Smartphone, X, Copy, ExternalLink, ChevronUp, ChevronDown, GripHorizontal, ChevronRight, ChevronLeft, Library } from 'lucide-react';
 import { LibraryView } from '../../views/LibraryView';
 import { DAWCenterPanel } from './DAWCenterPanel';
 
@@ -7,10 +7,29 @@ const CatalogueView = lazy(() => import('../../catalog/CatalogueView').then((m) 
 import { CenterTabBar } from './CenterTabBar';
 import { LogBody, LogActionButton, LogStripCompactInfo } from './ProcessingLog';
 import { BottomMultiTabPanel } from './BottomMultiTabPanel';
-import { DocsModal } from './DocsModal';
+// Lazy: the docs modal bundles a markdown/HTML renderer + screenshots; keep it
+// out of first paint and only fetch the chunk when the user opens Docs.
+const DocsModal = lazy(() => import('./DocsModal').then((m) => ({ default: m.DocsModal })));
 import { SettingsModal } from './SettingsModal';
+import { DawImportModal } from './DawImportModal';
+import { ProjectModal } from './ProjectModal';
+import { DownloadDock } from './DownloadDock';
 import { useAppUiStore } from '../../state/appUiStore';
 import { useBottomPanelStore } from '../../state/bottomPanelStore';
+import { useDawImportStore } from '../../state/dawImportStore';
+import { useProjectStore } from '../../state/projectStore';
+import { useEditLayoutStore } from '../../state/editLayoutStore';
+import { useEditorStore } from '../../state/editorStore';
+import { HamburgerMenu } from '../menu/HamburgerMenu';
+import { HomeScreen, useHomeScreenStore } from '../home/HomeScreen';
+import { OnboardingTour } from '../../onboarding/OnboardingTour';
+import { useOnboardingStore } from '../../onboarding/onboardingStore';
+import FeatureGateNotices from '../../notices/FeatureGateNotices';
+import { useStatusBarStore } from '../../state/statusBarStore';
+import { backendHttpBase, lanReachablePort } from '../../lib/backendBase';
+import { setXrHostPosture, onXrPeersChanged, kickXrPeer, type XrPeer } from '../../state/xrControlClient';
+import { useEditThemeStore } from '../../state/editThemeStore';
+import { resolveEditThemeVars } from '../../lib/editThemes';
 
 const RIGHT_RAIL_MIN = 280;
 const RIGHT_RAIL_MAX = 640;
@@ -27,6 +46,26 @@ export const Shell: React.FC = () => {
   const setLibraryExpanded = useAppUiStore((state) => state.setLibraryExpanded);
   const docsOpen = useAppUiStore((state) => state.docsOpen);
   const setDocsOpen = useAppUiStore((state) => state.setDocsOpen);
+  const openDawImport = useDawImportStore((state) => state.open);
+  const openProject = useProjectStore((state) => state.open);
+  const editLayoutActive = useEditLayoutStore((state) => state.active);
+  const toggleEditLayout = useEditLayoutStore((state) => state.toggle);
+  const loadProject = useEditorStore((state) => state.loadProject);
+  const homeOpen = useHomeScreenStore((state) => state.open);
+  const setHomeOpen = useHomeScreenStore((state) => state.setOpen);
+  const homeShowAtStartup = useHomeScreenStore((state) => state.showAtStartup);
+  const setHomeShowAtStartup = useHomeScreenStore((state) => state.setShowAtStartup);
+  const startTour = useOnboardingStore((state) => state.start);
+
+  // "New Project" clears the current arrangement back to a single empty track
+  // (editorStore.loadProject falls back to a clean track for empty input and
+  // resets undo history). Guarded so unsaved work is not lost silently.
+  const handleNewProject = React.useCallback(() => {
+    const ok = window.confirm(
+      'Start a new project? This clears the current arrangement. Save or back up first if you want to keep it.',
+    );
+    if (ok) loadProject({ tracks: [], clips: [] });
+  }, [loadProject]);
   const [settingsOpen, setSettingsOpen] = React.useState(false);
   const [shareOpen, setShareOpen] = React.useState(false);
   const [shareUrlOverride, setShareUrlOverride] = React.useState(() => {
@@ -40,30 +79,80 @@ export const Shell: React.FC = () => {
   // of localhost. Falls back to window.location.origin when there's no
   // LAN IP (e.g. offline). Mirrors how the VJ tab builds its mobile QR.
   const [lanUrl, setLanUrl] = React.useState('');
+  const isBackendReadyForLan = useStatusBarStore((s) => s.isBackendReady);
   React.useEffect(() => {
+    // Wait for the backend: on a packaged cold start this fetch used to fire
+    // once before :8600 was bound, fail, and leave the share link on the
+    // app://. origin fallback forever.
+    if (!isBackendReadyForLan || lanUrl) return;
     let cancelled = false;
     void fetch('/api/vj/lan-ip')
       .then((r) => (r.ok ? r.json() : null))
       .then((j: { lan_ip?: string | null } | null) => {
         if (cancelled || !j?.lan_ip || typeof window === 'undefined') return;
-        const port = window.location.port || '5173';
+        // Packaged app has no window port (app://. origin) — phones reach it
+        // on the backend port; browser dev keeps its own port (5173 fallback).
+        const port = lanReachablePort() || '5173';
         setLanUrl(`http://${j.lan_ip}:${port}`);
       })
       .catch(() => {
-        /* no backend / no LAN — keep the origin fallback */
+        /* no backend / no LAN — keep the http fallback */
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [isBackendReadyForLan, lanUrl]);
 
+  // Never fall back to window.location.origin blindly: in the packaged app
+  // that is app://., which is useless on a phone AND opens a second copy of
+  // the whole app when clicked. backendHttpBase() is always a real http URL.
   const detectedShareUrl =
-    lanUrl || (typeof window === 'undefined' ? '' : window.location.origin);
+    lanUrl || (typeof window === 'undefined' ? '' : backendHttpBase());
   const shareUrl = shareUrlOverride.trim() || detectedShareUrl;
   const qrImageUrl = useMemo(
     () => `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=12&data=${encodeURIComponent(shareUrl)}`,
     [shareUrl],
   );
+
+  // Phone-companion pairing. The host picks the posture (open LAN or a required
+  // code) before handing out the QR; the code rides the URL as ?pair=<code> so
+  // scanning auto-fills it. See docs/companion-control-contract.md.
+  const [postureMode, setPostureMode] = React.useState<'open' | 'code'>('open');
+  const [pairCode, setPairCode] = React.useState('');
+  const [companionPeers, setCompanionPeers] = React.useState<XrPeer[]>([]);
+  const [copiedCompanion, setCopiedCompanion] = React.useState(false);
+
+  React.useEffect(() => onXrPeersChanged(setCompanionPeers), []);
+  React.useEffect(() => {
+    setXrHostPosture({ mode: postureMode, code: postureMode === 'code' ? pairCode : null });
+  }, [postureMode, pairCode]);
+
+  const companionUrl = useMemo(() => {
+    const base = (shareUrl || '').replace(/\/+$/, '');
+    if (!base) return '';
+    const q = postureMode === 'code' && pairCode ? `?pair=${pairCode}` : '';
+    return `${base}/mobile.html${q}`;
+  }, [shareUrl, postureMode, pairCode]);
+  const companionQrUrl = useMemo(
+    () =>
+      companionUrl
+        ? `https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=12&data=${encodeURIComponent(companionUrl)}`
+        : '',
+    [companionUrl],
+  );
+  const chooseCodePosture = () => {
+    setPairCode((c) => c || Math.floor(1000 + Math.random() * 9000).toString());
+    setPostureMode('code');
+  };
+  const copyCompanionUrl = async () => {
+    try {
+      await navigator.clipboard.writeText(companionUrl);
+      setCopiedCompanion(true);
+      window.setTimeout(() => setCopiedCompanion(false), 1500);
+    } catch {
+      /* clipboard blocked — the URL is still visible to copy manually */
+    }
+  };
 
   const updateShareUrlOverride = (value: string) => {
     setShareUrlOverride(value);
@@ -125,13 +214,21 @@ export const Shell: React.FC = () => {
     };
   }, [isResizingRail, setRightPanelWidth]);
 
+  const editThemeId = useEditThemeStore((s) => s.themeId);
+  const editThemeImage = useEditThemeStore((s) => s.customImage);
+  const editTheme = useMemo(
+    () => resolveEditThemeVars(editThemeId, editThemeImage),
+    [editThemeId, editThemeImage],
+  );
+
   return (
     <div
-      className="flex flex-col w-full bg-[#07050a] text-[#f5f3ff] overflow-hidden font-sans dense-layout"
-      style={{ height: 'calc((100vh - 5rem) / var(--layout-zoom))' }}
+      className="edit-theme-scope relative flex flex-col w-full bg-[#07050a] text-[#f5f3ff] overflow-hidden font-sans dense-layout"
+      data-et-light={editTheme.light ? '1' : undefined}
+      style={{ height: 'calc((100vh - 5rem) / var(--layout-zoom))', ...(editTheme.vars as React.CSSProperties) }}
     >
       {/* Combined header + tab bar — logo (left), workspace tabs (center),
-          Docs / Mobile / Settings icons (right). G-Search moved to the footer. */}
+          Mobile / Docs / app-menu (right). G-Search moved to the footer. */}
       <header className="h-11 border-b border-white/5 flex items-center gap-3 px-3 bg-[#0a080f]/80 backdrop-blur-md z-10 shrink-0 relative">
         <a
           href="https://github.com/gantasmo/theDAW"
@@ -156,15 +253,7 @@ export const Shell: React.FC = () => {
         />
 
         <div className="flex items-center gap-2.5 shrink-0">
-          {/* Icon-only — the hover tooltip (title) names each one. The library
-              toggle is the right-edge pull handle (below), not a cluster icon.
-              All three carry the colored accent glow. */}
-          <TopBarButton
-            onClick={() => setDocsOpen(true)}
-            icon={<BookOpen className="w-3.5 h-3.5" />}
-            title="Open documentation"
-            accent="purple"
-          />
+          {/* Order: Mobile, Docs, then the app menu (hamburger) on the far right. */}
           <TopBarButton
             onClick={() => setShareOpen(true)}
             icon={<Smartphone className="w-3.5 h-3.5" />}
@@ -172,11 +261,28 @@ export const Shell: React.FC = () => {
             accent="emerald"
           />
           <TopBarButton
-            onClick={() => setSettingsOpen(true)}
-            icon={<Settings className="w-3.5 h-3.5 group-hover:rotate-90 transition-transform duration-500" />}
-            title="Settings"
-            accent="rose"
+            onClick={() => setDocsOpen(true)}
+            icon={<BookOpen className="w-3.5 h-3.5" />}
+            title="Open documentation"
+            accent="purple"
           />
+          {/* App menu — project ops, backup/migrate, updates, Settings, Edit
+              Layout, DAW import, and .tasmo save/open all live here. It is the
+              sole entry point for Settings (the header gear was retired). */}
+          <span data-tour="app-menu" className="inline-flex">
+            <HamburgerMenu
+              onNewProject={handleNewProject}
+              onOpenProject={() => openProject('open')}
+              onSaveProject={() => openProject('save')}
+              onImportDawProject={() => openDawImport()}
+              onToggleEditLayout={toggleEditLayout}
+              editLayoutActive={editLayoutActive}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onOpenDocs={() => setDocsOpen(true)}
+              onStartTour={startTour}
+              onOpenHome={() => setHomeOpen(true)}
+            />
+          </span>
         </div>
       </header>
 
@@ -191,6 +297,7 @@ export const Shell: React.FC = () => {
       {/* Library rail — compact side panel or expanded full-width catalogue. */}
       {isRightPanelOpen && (
         <aside
+          data-tour="library"
           className={`h-full min-h-0 flex flex-col bg-[#0a080f] border-l border-purple-500/20 shadow-[inset_1px_0_0_rgba(168,85,247,0.08)] z-20 relative ${isLibraryExpanded ? 'flex-1' : 'shrink-0'}`}
           style={isLibraryExpanded ? undefined : {
             width: rightPanelWidth,
@@ -222,19 +329,6 @@ export const Shell: React.FC = () => {
         </aside>
       )}
 
-      {/* Library pull handle — compact, vertically-centered tab on the right
-          edge of the work area, global across every workspace. Click toggles
-          the library panel; resize stays on the panel's inner edge. */}
-      <button
-        type="button"
-        onClick={() => setIsRightPanelOpen(!isRightPanelOpen)}
-        title={`${isRightPanelOpen ? 'Collapse' : 'Expand'} library`}
-        aria-label={`${isRightPanelOpen ? 'Collapse' : 'Expand'} library`}
-        className="absolute right-0 top-1/2 -translate-y-1/2 z-40 group flex flex-col items-center justify-center gap-1.5 h-24 w-7 rounded-l-lg border border-r-0 border-purple-400/60 bg-purple-500/20 text-purple-100 shadow-[0_0_16px_rgba(168,85,247,0.45)] hover:w-8 hover:text-white hover:border-purple-300/80 hover:bg-purple-500/35 hover:shadow-[0_0_22px_rgba(168,85,247,0.65)] transition-all"
-      >
-        <Library className="w-4 h-4" />
-        {isRightPanelOpen ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
-      </button>
       </div>
 
       {/* Global bottom dock — BottomMultiTabPanel (left, flex-1) and
@@ -245,7 +339,26 @@ export const Shell: React.FC = () => {
           bottomPanelStore) — expanding or resizing one does NOT
           affect the other. */}
       <ShellBottomDock />
-      <DocsModal open={docsOpen} onClose={() => setDocsOpen(false)} />
+
+      {/* Library pull handle — root-level so it floats ABOVE every panel (bottom
+          dock, log, maximized panels) and is never clipped by the work area's
+          overflow. Vertically centered on the right edge. Click toggles the
+          library; resize stays on the panel's inner edge. */}
+      <button
+        type="button"
+        onClick={() => setIsRightPanelOpen(!isRightPanelOpen)}
+        title={`${isRightPanelOpen ? 'Collapse' : 'Expand'} library`}
+        aria-label={`${isRightPanelOpen ? 'Collapse' : 'Expand'} library`}
+        className="absolute right-0 top-1/2 -translate-y-1/2 z-50 group flex flex-col items-center justify-center gap-1.5 h-24 w-7 rounded-l-lg border border-r-0 border-purple-400/60 bg-purple-500/20 text-purple-100 shadow-[0_0_16px_rgba(168,85,247,0.45)] hover:w-8 hover:text-white hover:border-purple-300/80 hover:bg-purple-500/35 hover:shadow-[0_0_22px_rgba(168,85,247,0.65)] transition-all"
+      >
+        <Library className="w-4 h-4" />
+        {isRightPanelOpen ? <ChevronRight className="w-4 h-4" /> : <ChevronLeft className="w-4 h-4" />}
+      </button>
+      {docsOpen && (
+        <Suspense fallback={null}>
+          <DocsModal open={docsOpen} onClose={() => setDocsOpen(false)} />
+        </Suspense>
+      )}
       {shareOpen && (
         <div className="fixed inset-0 z-60 flex items-center justify-center">
           <div className="absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={() => setShareOpen(false)} />
@@ -309,11 +422,124 @@ export const Shell: React.FC = () => {
                   By default this uses <span className="font-mono text-zinc-400">{detectedShareUrl}</span>. Paste a Cloudflare Tunnel or other public URL here when your phone is not on the same network.
                 </p>
               </div>
+
+              {/* Phone companion — a lean remote app (library + player control),
+                  separate from opening the full desktop UI above. */}
+              <div className="flex flex-col gap-2 pt-3 border-t border-white/5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[9px] font-black uppercase tracking-widest text-purple-300">Phone companion</span>
+                  <span className="text-[8px] font-mono uppercase tracking-wider text-purple-300/50">library + remote</span>
+                </div>
+                <p className="text-[9px] leading-relaxed text-zinc-500">
+                  A lightweight phone app to browse and play the library and remote-control the player. Choose who may drive this desktop before you share the code.
+                </p>
+
+                {/* Posture: both options shown; the host selects before allowing a peer. */}
+                <div className="flex gap-2">
+                  <button
+                    type="button"
+                    aria-pressed={postureMode === 'open'}
+                    onClick={() => setPostureMode('open')}
+                    className={`flex-1 px-2 py-1.5 rounded border text-[9px] font-black uppercase tracking-widest transition-colors ${postureMode === 'open' ? 'border-purple-400/60 bg-purple-500/20 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-200'}`}
+                  >
+                    Open LAN
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={postureMode === 'code'}
+                    onClick={chooseCodePosture}
+                    className={`flex-1 px-2 py-1.5 rounded border text-[9px] font-black uppercase tracking-widest transition-colors ${postureMode === 'code' ? 'border-purple-400/60 bg-purple-500/20 text-purple-100' : 'border-white/10 bg-black/30 text-zinc-400 hover:text-zinc-200'}`}
+                  >
+                    Require code
+                  </button>
+                </div>
+
+                {postureMode === 'code' && (
+                  <div className="flex items-center justify-between px-3 py-2 rounded bg-black/40 border border-purple-500/20">
+                    <span className="text-[9px] font-mono uppercase tracking-widest text-zinc-400">Pair code</span>
+                    <span className="text-[15px] font-mono font-black tracking-[0.35em] text-purple-200">{pairCode}</span>
+                  </div>
+                )}
+
+                {companionQrUrl && (
+                  <div className="flex justify-center pt-1">
+                    <div className="p-3 rounded-lg bg-white shadow-[0_0_24px_rgba(139,92,246,0.16)]">
+                      <img src={companionQrUrl} alt="theDAW phone companion QR code" className="w-44 h-44" />
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1.5">
+                  <label htmlFor="shell-companion-url" className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Companion URL</label>
+                  <div className="flex gap-2">
+                    <input
+                      id="shell-companion-url"
+                      type="text"
+                      name="shell-companion-url"
+                      value={companionUrl}
+                      readOnly
+                      className="flex-1 bg-black/40 border border-white/10 rounded px-2 py-1.5 text-[10px] font-mono text-zinc-200 outline-none"
+                    />
+                    <button
+                      onClick={() => void copyCompanionUrl()}
+                      className="px-2 py-1.5 rounded border border-purple-500/30 bg-purple-500/10 hover:bg-purple-500/20 text-purple-200 text-[9px] font-black uppercase tracking-widest flex items-center gap-1.5"
+                      title="Copy companion URL"
+                    >
+                      <Copy className="w-3 h-3" /> {copiedCompanion ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                </div>
+
+                {companionPeers.length > 0 && (
+                  <div className="flex flex-col gap-1.5">
+                    <span className="text-[9px] font-black uppercase tracking-widest text-zinc-400">Connected ({companionPeers.length})</span>
+                    <ul className="flex flex-col gap-1">
+                      {companionPeers.map((p) => (
+                        <li key={p.peerId} className="flex items-center justify-between px-2 py-1.5 rounded bg-black/30 border border-white/10">
+                          <span className="text-[10px] font-mono text-zinc-200">{p.label}</span>
+                          <button
+                            type="button"
+                            onClick={() => kickXrPeer(p.peerId)}
+                            aria-label={`Disconnect ${p.label}`}
+                            className="px-2 py-0.5 rounded border border-red-500/30 bg-red-500/10 hover:bg-red-500/20 text-red-200 text-[8px] font-black uppercase tracking-widest"
+                          >
+                            Kick
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
       )}
       <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      <DawImportModal />
+      <ProjectModal />
+      {/* Floating model-download manager — fixed bottom-right, self-hiding when
+          there are no downloads. Mounted once at the app root so it floats over
+          every view. */}
+      <DownloadDock />
+      {/* Feature-gate notices (bottom-right stack) — offsets itself above the
+          DownloadDock when downloads are active. Renders null when empty. */}
+      <FeatureGateNotices />
+      {/* Startup HOME landing (card grid per workspace). Auto-opened by App on
+          returning launches; also reachable from the app menu. */}
+      {homeOpen && (
+        <HomeScreen
+          showAtStartup={homeShowAtStartup}
+          onToggleShowAtStartup={setHomeShowAtStartup}
+          onNavigate={(tab) => setCenterTab(tab)}
+          onOpenProject={() => openProject('open')}
+          onStartTour={startTour}
+          onClose={() => setHomeOpen(false)}
+        />
+      )}
+      {/* First-run feature tour (spotlight overlay). Reads its own store; the
+          shell only supplies the tab-switch hook so steps can jump workspaces. */}
+      <OnboardingTour onSwitchTab={setCenterTab} />
     </div>
   );
 };
@@ -365,8 +591,15 @@ const ShellBottomDock: React.FC = () => {
   const multiMaximized = useBottomPanelStore((s) => s.multiMaximized);
 
   // Dock-body height — shared by the multi-tab panel (in-flow) and the floating
-  // LOG overlay. Maximized fills the work area.
-  const bodyHeight = multiMaximized ? 'calc(100vh - 7rem)' : `${multiHeight}px`;
+  // LOG overlay. Maximized fills the work area. The height MUST be computed in
+  // the same zoom-aware space as the .dense-layout root (height =
+  // calc((100vh - 5rem) / var(--layout-zoom))); a raw `100vh` calc here ignores
+  // --layout-zoom and, at zoom > 1, overflows the root's overflow-hidden so the
+  // dock's own bottom (e.g. the Score viewer's page/zoom controls) is clipped.
+  // Reserve 5rem inside the root for the header (h-11) + the always-on strip.
+  const bodyHeight = multiMaximized
+    ? 'calc((100vh - 5rem) / var(--layout-zoom) - 5rem)'
+    : `${multiHeight}px`;
   // The LOG strip section auto-fits its content (the telemetry readouts + the
   // fixed action button). Mirror its measured width into logWidth so the LOG
   // body directly below it stays column-aligned (opens to the same left edge).

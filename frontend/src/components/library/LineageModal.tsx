@@ -1,4 +1,4 @@
-import React, { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, lazy, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Network, X, GitBranch, GitFork, Workflow, Maximize2, Minimize2, Sliders, Maximize, Copy, Crosshair, Package, GitMerge, Library as LibraryIcon, Home, Rocket } from 'lucide-react';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
@@ -15,6 +15,7 @@ export interface GraphNode {
   source?: string;
   duration_sec?: number;
   model?: string;
+  play_count?: number;
 }
 
 export interface GraphEdge {
@@ -41,6 +42,11 @@ interface LineageModalProps {
    *  new center bar. Defaults to 'modal' so existing callers don't
    *  change behaviour. */
   mode?: 'modal' | 'embedded';
+  /** For the warm-mounted embedded view: whether the hosting tab is
+   *  currently shown. A false->true flip triggers a freshness refetch
+   *  of the bulk graph endpoint (rebuild only if the payload changed).
+   *  Defaults to true so modal callers keep their behaviour. */
+  visible?: boolean;
 }
 
 type VizPreset =
@@ -116,8 +122,8 @@ const DEFAULT_APPEARANCE: GraphAppearance = {
   controlType: 'trackball',
   wireframe: false,
   clusterColoring: false,
-  colGap: 90,
-  rowGap: 14,
+  colGap: 48,
+  rowGap: 8,
   charge: -90,
   linkDistance: 18,
   hoverDepth: 2,
@@ -131,6 +137,10 @@ function loadStoredAppearance(): GraphAppearance {
     const raw = window.localStorage.getItem(APPEARANCE_STORAGE_KEY);
     if (!raw) return DEFAULT_APPEARANCE;
     const parsed = JSON.parse(raw) as Partial<GraphAppearance>;
+    // One-shot migration: gaps stored at the OLD defaults (90/14) follow the
+    // new tighter defaults; explicitly slider-tuned values are preserved.
+    if (parsed.colGap === 90) delete parsed.colGap;
+    if (parsed.rowGap === 14) delete parsed.rowGap;
     // Merge over defaults so newly-added fields take their default
     // when an older payload is read back.
     return { ...DEFAULT_APPEARANCE, ...parsed };
@@ -287,12 +297,17 @@ function computeLineage(
   return out;
 }
 
-/** Uniform highlight: every lineage-connected node/edge is full brightness, the
- *  rest is heavily dimmed (no per-generation falloff). */
-const lineageOpacity = (onPath: boolean): number => (onPath ? 1 : 0.12);
+// Short intent delay so the highlight lands fast; the leave-side grace timer
+// (see leaveNode) is what absorbs the gap-crossing between adjacent cards.
+const LINEAGE_HOVER_INTENT_MS = 120;
 
-const LINEAGE_HOVER_INTENT_MS = 200;
-const LINEAGE_FADE_MS = 3000;
+// Genealogy grid geometry (px). Square cards; the gaps come from the sliders.
+const NODE_W = 140;
+const NODE_H = 140;
+const PAD = 24;
+const TOP_MARGIN = 8;
+// Vertical gap between the lineage DAG and the no-lineage band below it.
+const BAND_GAP = 72;
 
 const EDGE_COLOR_BY_KIND: Record<string, string> = {
   chimera_source_of: '#a78bfa',
@@ -318,7 +333,7 @@ const CLUSTER_TINT_BY_SOURCE: Record<string, string> = {
   other: '#94a3b8',
 };
 
-export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, onClose, mode = 'modal' }) => {
+export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, onClose, mode = 'modal', visible = true }) => {
   const embedded = mode === 'embedded';
   const [tab, setTab] = useState<LineageTab>('track');
   const [perTrack, setPerTrack] = useState<GraphPayload | null>(null);
@@ -329,6 +344,73 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
   // Hydrated from localStorage so settings survive a reload.
   const [appearance, setAppearance] = useState<GraphAppearance>(loadStoredAppearance);
   const [appearanceOpen, setAppearanceOpen] = useState(false);
+  // Genealogy Fit/Reset live in this header but operate on the GenealogyView.
+  const genControls = useRef<{ fit: () => void; reset: () => void } | null>(null);
+
+  // Header highlight controls, shared by Genealogy AND the 3D graph:
+  // MOST/LEAST (connection count), PLAYS (play count), plus a title search.
+  // The computed highlightSet is passed to both views, which render its
+  // members with an amber accent.
+  const [highlightMode, setHighlightMode] = useState<'most' | 'least' | 'plays' | null>(null);
+  const [graphSearch, setGraphSearch] = useState('');
+  const [graphNeedle, setGraphNeedle] = useState('');
+  // Debounced so per-keystroke typing doesn't remount three.js node groups.
+  useEffect(() => {
+    const trimmed = graphSearch.trim().toLowerCase();
+    if (!trimmed) {
+      setGraphNeedle('');
+      return;
+    }
+    const handle = window.setTimeout(() => setGraphNeedle(trimmed), 150);
+    return () => window.clearTimeout(handle);
+  }, [graphSearch]);
+
+  const degreeById = useMemo(() => {
+    const deg: Record<string, number> = {};
+    (libraryGraph?.nodes ?? []).forEach((n) => {
+      deg[n.id] = 0;
+    });
+    (libraryGraph?.edges ?? []).forEach((e) => {
+      deg[e.from_id] = (deg[e.from_id] ?? 0) + 1;
+      deg[e.to_id] = (deg[e.to_id] ?? 0) + 1;
+    });
+    return deg;
+  }, [libraryGraph]);
+
+  const searchMatches = useMemo(() => {
+    if (!graphNeedle) return null;
+    const out = new Set<string>();
+    for (const n of libraryGraph?.nodes ?? []) {
+      if (`${n.title ?? ''} ${n.id}`.toLowerCase().includes(graphNeedle)) out.add(n.id);
+    }
+    return out;
+  }, [graphNeedle, libraryGraph]);
+
+  const highlightSet = useMemo(() => {
+    const out = new Set<string>();
+    const nodes = libraryGraph?.nodes ?? [];
+    if (highlightMode === 'most' || highlightMode === 'least') {
+      const degrees = nodes.map((n) => degreeById[n.id] ?? 0);
+      if (degrees.length) {
+        const tier = highlightMode === 'most' ? Math.max(...degrees) : Math.min(...degrees);
+        // MOST is meaningless when nothing is connected at all.
+        if (highlightMode === 'least' || tier > 0) {
+          nodes.forEach((n) => {
+            if ((degreeById[n.id] ?? 0) === tier) out.add(n.id);
+          });
+        }
+      }
+    } else if (highlightMode === 'plays') {
+      const top = Math.max(0, ...nodes.map((n) => n.play_count ?? 0));
+      if (top > 0) {
+        nodes.forEach((n) => {
+          if ((n.play_count ?? 0) === top) out.add(n.id);
+        });
+      }
+    }
+    searchMatches?.forEach((id) => out.add(id));
+    return out;
+  }, [libraryGraph, highlightMode, degreeById, searchMatches]);
 
   // Persist appearance changes to localStorage (debounced via the
   // natural batching of React state updates — each setAppearance flushes
@@ -368,17 +450,51 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
   }, [active, rootEntryId]);
 
   // Fetch the full library graph for the family-tree + 3D-graph views.
-  useEffect(() => {
-    if (!active) return;
-    if (tab !== 'genealogy' && tab !== 'graph3d') return;
-    if (libraryGraph !== null) return;
-    setLoading(true);
+  // The bulk endpoint is cheap (~60ms), so it is re-hit every time the
+  // view is (re-)shown; the payload only replaces state — and thereby
+  // rebuilds the layout/DOM, discarding pan/zoom — when its signature
+  // (node/edge counts + byte length) differs from the last build. An
+  // unchanged library keeps the warm graph exactly as the user left it
+  // while new entries still appear without a manual reload.
+  const graphSigRef = useRef<string | null>(null);
+  const fetchLibraryGraph = useCallback(() => {
+    // Only the very first load shows the loading overlay; freshness
+    // refetches on re-show run silently behind the warm graph.
+    const initial = graphSigRef.current === null;
+    if (initial) setLoading(true);
     void fetch('/api/library/_graph/all')
       .then((r) => r.json())
-      .then((j: GraphPayload) => setLibraryGraph(j))
-      .catch(() => setLibraryGraph({ nodes: [], edges: [] }))
-      .finally(() => setLoading(false));
-  }, [active, tab, libraryGraph]);
+      .then((j: GraphPayload) => {
+        const sig = `${j?.nodes?.length ?? 0}:${j?.edges?.length ?? 0}:${JSON.stringify(j).length}`;
+        if (graphSigRef.current === sig) return;
+        graphSigRef.current = sig;
+        setLibraryGraph(j);
+      })
+      .catch(() => {
+        // Keep any prior graph on a failed refresh; only seed the empty
+        // placeholder when nothing was ever loaded. graphSigRef stays
+        // null so the next attempt is still treated as the initial one.
+        setLibraryGraph((cur) => cur ?? { nodes: [], edges: [] });
+      })
+      .finally(() => {
+        if (initial) setLoading(false);
+      });
+  }, []);
+  useEffect(() => {
+    if (!active || !visible) return;
+    if (tab !== 'genealogy' && tab !== 'graph3d') return;
+    fetchLibraryGraph();
+  }, [active, visible, tab, fetchLibraryGraph]);
+
+  // The embedded fullscreen overlay portals to document.body, so it
+  // escapes the warm-mounted tab's display:none wrapper. A programmatic
+  // tab switch (a DAW import jumping to EDIT, an automix jumping to DJ)
+  // would otherwise leave the z-200 overlay covering the new tab with no
+  // close affordance. Exiting fullscreen whenever the host tab is hidden
+  // keeps the overlay scoped to the tab that opened it.
+  useEffect(() => {
+    if (!visible) setFullscreen(false);
+  }, [visible]);
 
   if (!active) return null;
 
@@ -425,12 +541,70 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
                 Track
               </TabButton>
             )}
+            {tab === 'genealogy' && (
+              <>
+                <button
+                  onClick={() => genControls.current?.fit()}
+                  className="flex items-center gap-1 px-2 py-1 rounded text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:text-purple-200 bg-purple-500/15 border border-purple-500/30 hover:border-purple-400/60"
+                  title="Fit the entire genealogy into the viewport"
+                >
+                  <Maximize className="w-2.5 h-2.5" /> Fit
+                </button>
+                <button
+                  onClick={() => genControls.current?.reset()}
+                  className="mr-1 flex items-center px-2 py-1 rounded text-[9px] font-mono uppercase tracking-widest text-zinc-400 hover:text-zinc-200 bg-black/40 border border-white/10"
+                  title="Reset to native scale"
+                >
+                  Reset
+                </button>
+              </>
+            )}
             <TabButton active={tab === 'genealogy'} onClick={() => setTab('genealogy')} icon={<GitFork className="w-3 h-3" />}>
               Genealogy
             </TabButton>
             <TabButton active={tab === 'graph3d'} onClick={() => setTab('graph3d')} icon={<Workflow className="w-3 h-3" />}>
               3D graph
             </TabButton>
+            {(tab === 'genealogy' || tab === 'graph3d') && (
+              <>
+                <span className="mx-1 w-px h-4 bg-white/10" aria-hidden="true" />
+                {(
+                  [
+                    ['most', 'Most', 'Highlight the node(s) with the most connections'],
+                    ['least', 'Least', 'Highlight the node(s) with the fewest connections'],
+                    ['plays', 'Plays', 'Highlight the most-played node(s)'],
+                  ] as const
+                ).map(([mode, label, tip]) => (
+                  <button
+                    key={mode}
+                    onClick={() => setHighlightMode((cur) => (cur === mode ? null : mode))}
+                    className={`px-2 py-1 rounded text-[9px] font-mono uppercase tracking-widest border ${
+                      highlightMode === mode
+                        ? 'bg-amber-500/20 text-amber-200 border-amber-400/50'
+                        : 'bg-black/40 text-zinc-400 border-white/10 hover:text-zinc-200'
+                    }`}
+                    title={tip}
+                  >
+                    {label}
+                  </button>
+                ))}
+                <input
+                  id="lineage-header-search"
+                  name="lineage-header-search"
+                  type="search"
+                  aria-label="Search node titles"
+                  value={graphSearch}
+                  onChange={(e) => setGraphSearch(e.target.value)}
+                  placeholder="Search titles…"
+                  className="ml-1 w-36 bg-black/60 border border-purple-500/30 rounded px-2 py-1 text-[10px] font-mono text-zinc-200 placeholder-zinc-500 focus:outline-none focus:border-purple-400/60"
+                />
+                {searchMatches !== null && (
+                  <span className="text-[9px] font-mono text-amber-300/90 px-1.5 py-0.5 bg-amber-500/10 border border-amber-500/20 rounded">
+                    {searchMatches.size}
+                  </span>
+                )}
+              </>
+            )}
             {tab === 'graph3d' && (
               <button
                 onClick={() => setAppearanceOpen((v) => !v)}
@@ -458,36 +632,57 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
           </div>
         </div>
 
-        {/* Body */}
+        {/* Body. The inline-embedded (LEARN tab) case sits inside the
+            Shell's `.dense-layout` CSS zoom, which breaks the graph
+            libraries' pointer math (three-render-objects raycasts and the
+            SVG pan/drag both assume unzoomed CSS pixels). The inner
+            wrapper counter-zooms by 1/zoom and pre-scales its box by zoom
+            so the graph area runs at an effective scale of 1 — matching
+            the portaled modal and fullscreen paths, which stay untouched
+            (they get a plain full-size wrapper). */}
         <div className="flex-1 min-h-0 relative">
-          {loading && (
-            <div className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">
-              Loading lineage…
-            </div>
-          )}
-          {tab === 'track' && rootEntryId && perTrack && (
-            <TrackTreeView root={rootEntryId} payload={perTrack} />
-          )}
-          {tab === 'genealogy' && libraryGraph && (
-            <GenealogyView payload={libraryGraph} appearance={appearance} />
-          )}
-          {tab === 'graph3d' && libraryGraph && (
-            <Suspense fallback={<div className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">Loading 3D engine…</div>}>
-              <Graph3DView
-                payload={libraryGraph}
-                highlight={rootEntryId}
-                appearance={appearance}
-              />
-            </Suspense>
-          )}
+          <div
+            className="relative"
+            style={useInlineLayout
+              ? {
+                  zoom: 'calc(1 / var(--layout-zoom, 1))',
+                  width: 'calc(100% * var(--layout-zoom, 1))',
+                  height: 'calc(100% * var(--layout-zoom, 1))',
+                }
+              : { width: '100%', height: '100%' }}
+          >
+            {loading && (
+              <div className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">
+                Loading lineage…
+              </div>
+            )}
+            {tab === 'track' && rootEntryId && perTrack && (
+              <TrackTreeView root={rootEntryId} payload={perTrack} />
+            )}
+            {tab === 'genealogy' && libraryGraph && (
+              <GenealogyView payload={libraryGraph} appearance={appearance} controlsRef={genControls} highlightSet={highlightSet} />
+            )}
+            {tab === 'graph3d' && libraryGraph && (
+              <Suspense fallback={<div className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">Loading 3D engine…</div>}>
+                <Graph3DView
+                  payload={libraryGraph}
+                  highlight={rootEntryId}
+                  appearance={appearance}
+                  visible={visible}
+                  highlightSet={highlightSet}
+                  searchNeedle={graphNeedle}
+                />
+              </Suspense>
+            )}
 
-          {tab === 'graph3d' && appearanceOpen && (
-            <AppearancePanel
-              value={appearance}
-              onChange={setAppearance}
-              onClose={() => setAppearanceOpen(false)}
-            />
-          )}
+            {tab === 'graph3d' && appearanceOpen && (
+              <AppearancePanel
+                value={appearance}
+                onChange={setAppearance}
+                onClose={() => setAppearanceOpen(false)}
+              />
+            )}
+          </div>
         </div>
 
         {/* Footer: edge-kind color key (left) + genealogy spacing (right). */}
@@ -500,8 +695,8 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
           ))}
           {tab === 'genealogy' && (
             <div className="ml-auto flex items-center gap-4 normal-case">
-              <FooterRange label="Gen gap" value={appearance.colGap} min={40} max={320} step={5} onChange={(v) => setAppearance({ ...appearance, colGap: v })} />
-              <FooterRange label="Row gap" value={appearance.rowGap} min={4} max={200} step={2} onChange={(v) => setAppearance({ ...appearance, rowGap: v })} />
+              <FooterRange label="Gen gap" value={appearance.colGap} min={40} max={1200} step={5} onChange={(v) => setAppearance({ ...appearance, colGap: v })} />
+              <FooterRange label="Row gap" value={appearance.rowGap} min={4} max={800} step={2} onChange={(v) => setAppearance({ ...appearance, rowGap: v })} />
             </div>
           )}
         </div>
@@ -521,11 +716,14 @@ export const LineageModal: React.FC<LineageModalProps> = ({ open, rootEntryId, o
 
 /** Embedded variant of LineageModal — mounts the lineage UI inline
  *  (no backdrop, no portal, no close button) for use as the LEARN tab
- *  in the new center bar. Always-live; doesn't take an `open` prop. */
-export const LineageView: React.FC<{ rootEntryId?: string | null }> = ({ rootEntryId = null }) => (
+ *  in the new center bar. Always-live; doesn't take an `open` prop.
+ *  `visible` mirrors whether the warm-mounted host tab is shown so the
+ *  view can refresh its data on re-show. */
+export const LineageView: React.FC<{ rootEntryId?: string | null; visible?: boolean }> = ({ rootEntryId = null, visible = true }) => (
   <LineageModal
     mode="embedded"
     open={true}
+    visible={visible}
     rootEntryId={rootEntryId}
     onClose={() => {
       /* no-op in embedded mode */
@@ -614,8 +812,9 @@ const Column: React.FC<{ title: string; nodes: GraphNode[]; accent: string; high
 
 /** Library-wide genealogy: a layered DAG layout (Sugiyama-style).
  *
- *  1. Filter to nodes that participate in at least one relation —
- *     isolated tracks aren't "genealogy", they're just unrelated entries.
+ *  1. Take EVERY library node — tracks without any recorded relation
+ *     included (they render as generation-0 cards with no lines), so the
+ *     view covers the whole library rather than only related entries.
  *  2. Assign each node to a generation = longest path from any root.
  *  3. Within each generation, order nodes via the median heuristic to
  *     minimize parent↔child edge crossings (cheap, gives a clearly
@@ -631,9 +830,10 @@ const Column: React.FC<{ title: string; nodes: GraphNode[]; accent: string; high
  *  flips re-render. This is what kills the per-hover lag and flash; the outer
  *  <g> (opacity/transform/handlers) stays in the parent and is cheap to diff. */
 const GenNodeBody = React.memo(function GenNodeBody({
-  n, sourceColor, strong, w, h,
+  n, title, sourceColor, strong, w, h,
 }: {
   n: GraphNode;
+  title: string;
   sourceColor: string;
   strong: boolean;
   w: number;
@@ -653,7 +853,7 @@ const GenNodeBody = React.memo(function GenNodeBody({
       />
       <rect width={w} height={4} rx={2} ry={2} fill={sourceColor} opacity={0.85} />
       <text x={10} y={24} fill="#f4f4f5" fontSize={12} fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace" fontWeight={700}>
-        {truncate(n.title ?? n.id, 21)}
+        {truncate(title, 18)}
       </text>
       <line x1={10} y1={31} x2={w - 10} y2={31} stroke="#ffffff" strokeOpacity={0.08} />
       {(
@@ -704,7 +904,15 @@ const GenEdgeBody = React.memo(function GenEdgeBody({
   );
 });
 
-const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearance }> = ({ payload, appearance }) => {
+const GenealogyView: React.FC<{
+  payload: GraphPayload;
+  appearance: GraphAppearance;
+  /** Lets the parent header drive Fit/Reset (moved out of the canvas corner). */
+  controlsRef?: React.MutableRefObject<{ fit: () => void; reset: () => void } | null>;
+  /** Nodes to render with the amber accent ring (header MOST/LEAST/PLAYS
+   *  toggles + title search). */
+  highlightSet?: Set<string>;
+}> = ({ payload, appearance, controlsRef, highlightSet }) => {
   // Hover lights up a node's full lineage (uniform brightness both ways).
   const [hovered, setHovered] = useState<string | null>(null);
   // Hover is smoothed: moving the cursor straight from one node to the next
@@ -734,7 +942,13 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     if (zoomingRef.current) return;
     clearHoverIntent();
     if (hoverClearRef.current != null) { window.clearTimeout(hoverClearRef.current); hoverClearRef.current = null; }
-    setHovered(null);
+    // Grace timer: clearing after a short delay lets the cursor cross the
+    // gap between adjacent cards without the highlight blinking off —
+    // enterNode cancels this pending clear when the next card is reached.
+    hoverClearRef.current = window.setTimeout(() => {
+      setHovered(null);
+      hoverClearRef.current = null;
+    }, 280);
   }, [clearHoverIntent]);
   useEffect(() => () => {
     clearHoverIntent();
@@ -742,19 +956,19 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
   }, [clearHoverIntent]);
   // Click opens the detail/analytics inspector for that node.
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  // -- Filter to the connected subgraph --------------------------------
+  // Viewport size — the grid uses the panel's aspect ratio to choose its row
+  // count so it fills the window (see fillRows).
+  const [containerSize, setContainerSize] = useState({ w: 0, h: 0 });
+  // -- Graph input: ALL nodes, including lineage-less tracks -----------
+  // Tracks with no recorded relations render too (as generation-0 cards
+  // with no connecting lines) so the genealogy shows the whole library,
+  // not only entries that already participate in an edge.
   const connected = useMemo(() => {
-    const involved = new Set<string>();
     // Defensive: a malformed/empty payload (e.g. backend offline) must degrade
     // to an empty graph, never crash the whole tab.
     const allEdges = payload?.edges ?? [];
-    const allNodes = payload?.nodes ?? [];
-    allEdges.forEach((e) => {
-      involved.add(e.from_id);
-      involved.add(e.to_id);
-    });
-    const nodes = allNodes.filter((n) => involved.has(n.id));
-    // Also keep any edges whose endpoints both still exist (defensive).
+    const nodes = payload?.nodes ?? [];
+    // Keep only edges whose endpoints both exist (defensive).
     const idSet = new Set(nodes.map((n) => n.id));
     const edges = allEdges.filter(
       (e) => idSet.has(e.from_id) && idSet.has(e.to_id),
@@ -782,11 +996,24 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     [hovered, parentsOf, childrenOf],
   );
 
+  // Tracks with no relations at all render in their own wrapping band BELOW
+  // the DAG. Mixed into generation 0 they inflated its width by hundreds of
+  // columns (a full library is thousands of standalone tracks), which pushed
+  // the real family tree off the right edge and crushed fit-to-view into
+  // unreadable soup.
+  const isolatedIds = useMemo(() => {
+    const out = new Set<string>();
+    connected.nodes.forEach((n) => {
+      if (!childrenOf[n.id]?.length && !parentsOf[n.id]?.length) out.add(n.id);
+    });
+    return out;
+  }, [connected, childrenOf, parentsOf]);
+
   // -- Step 1: assign layer = longest path from any root --------------
   const layers = useMemo(() => {
     const out: Record<string, number> = {};
     const roots = connected.nodes.filter(
-      (n) => !(parentsOf[n.id] && parentsOf[n.id].length),
+      (n) => !isolatedIds.has(n.id) && !(parentsOf[n.id] && parentsOf[n.id].length),
     );
     // Multi-pass relaxation so that a node at the bottom of a long
     // chain ends up at the deepest layer.
@@ -808,15 +1035,16 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
       });
     }
     connected.nodes.forEach((n) => {
-      if (out[n.id] == null) out[n.id] = 0;
+      if (!isolatedIds.has(n.id) && out[n.id] == null) out[n.id] = 0;
     });
     return out;
-  }, [connected, parentsOf]);
+  }, [connected, parentsOf, isolatedIds]);
 
   // -- Step 2: order within layer via median heuristic ----------------
   const orderedRows = useMemo(() => {
     const grouped: Record<number, string[]> = {};
     connected.nodes.forEach((n) => {
+      if (isolatedIds.has(n.id)) return; // band-only, not a DAG generation
       const d = layers[n.id] ?? 0;
       (grouped[d] = grouped[d] || []).push(n.id);
     });
@@ -833,111 +1061,119 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
 
     // Median-of-parents heuristic, sweeping top-down then bottom-up
     // a few times. This is the simplest crossing-reduction step in
-    // the Sugiyama framework.
-    const positionInRow = (id: string, row: string[]): number => row.indexOf(id);
+    // the Sugiyama framework. Rank Maps (id -> row index) replace the
+    // old repeated includes/indexOf scans, and each sweep precomputes
+    // one median value per id before sorting so the comparator is a
+    // pair of Map lookups. The resulting ordering is byte-identical to
+    // the scan-based version; only the cost changes.
     for (let iter = 0; iter < 12; iter += 1) {
       const topDown = iter % 2 === 0;
       const order = topDown ? layerKeys.slice(1) : layerKeys.slice(0, -1).reverse();
       order.forEach((d) => {
         const adjLayer = topDown ? d - 1 : d + 1;
-        const adjRow = grouped[adjLayer] || [];
         const adjMap = topDown ? parentsOf : childrenOf;
-        const newRow = [...grouped[d]];
-        const medianOf = (id: string): number => {
-          const refs = (adjMap[id] || []).filter((n) => adjRow.includes(n));
-          if (refs.length === 0) return positionInRow(id, grouped[d]);
-          const positions = refs
-            .map((r) => positionInRow(r, adjRow))
-            .filter((p) => p >= 0)
+        const adjIndex = new Map<string, number>();
+        (grouped[adjLayer] || []).forEach((id, i) => adjIndex.set(id, i));
+        const rowIndex = new Map<string, number>();
+        grouped[d].forEach((id, i) => rowIndex.set(id, i));
+        const medianVal = new Map<string, number>();
+        grouped[d].forEach((id) => {
+          const positions = (adjMap[id] || [])
+            .map((r) => adjIndex.get(r))
+            .filter((p): p is number => p !== undefined)
             .sort((a, b) => a - b);
-          if (positions.length === 0) return positionInRow(id, grouped[d]);
-          return positions[Math.floor(positions.length / 2)];
-        };
-        newRow.sort((a, b) => medianOf(a) - medianOf(b));
+          medianVal.set(
+            id,
+            positions.length === 0
+              ? (rowIndex.get(id) as number)
+              : positions[Math.floor(positions.length / 2)],
+          );
+        });
+        const newRow = [...grouped[d]];
+        newRow.sort((a, b) => (medianVal.get(a) as number) - (medianVal.get(b) as number));
         grouped[d] = newRow;
       });
     }
 
     return layerKeys.map((d) => ({ layer: d, ids: grouped[d] }));
-  }, [connected, nodeMap, layers, parentsOf, childrenOf]);
+  }, [connected, nodeMap, layers, parentsOf, childrenOf, isolatedIds]);
 
   // -- Step 3: coordinate assignment ----------------------------------
-  // Layout is LEFT→RIGHT: each generation is a vertical column of
-  // stacked sub-rows. When a generation has many nodes we split it
-  // across multiple SUB-COLUMNS (brick pattern) so a single generation
-  // doesn't run off the bottom of the modal. Alternating sub-columns
-  // are offset vertically by NODE_H/2 to stagger like the user's
-  // reference screenshot.
-  // Cards are a 4:3 landscape block (was a long 3.5:1 strip) so they can show
-  // more per-entry info without overlapping.
-  const NODE_W = 168;
-  const NODE_H = 126;
-  const COL_GAP = appearance.colGap;                          // gap between GENERATIONS
-  const SUBCOL_GAP = Math.max(8, Math.round(appearance.colGap * 0.31)); // sub-columns within a generation
-  const ROW_GAP = appearance.rowGap;                          // gap between stacked nodes in a sub-column
-  const PAD = 32;
-  const STAGGER_PX = NODE_H * 0.5;
-  const MAX_NODES_PER_SUBCOL = 14;
+  // Square cards pack into a grid that fills the panel; gaps come from sliders.
+  const ROW_GAP = appearance.rowGap;            // vertical gap between nodes
+  const SUBCOL_GAP = ROW_GAP;                    // uniform horizontal gap inside a generation
+  const GEN_GAP = appearance.colGap;            // larger gap BETWEEN generations
+
+  // Row count chosen so the layout's aspect ratio matches the panel's — that is
+  // what fills the window instead of leaving tall empty bands above and below.
+  // For N nodes in an A:1 panel with ~square cells the space-optimal grid is
+  // R = sqrt(N / A) rows × ~N/R columns (e.g. 144 nodes @ 16:9 → 9×16). Each
+  // generation packs its nodes column-major into R rows.
+  const fillRows = useMemo(() => {
+    // Sized to the DAG only — the isolated band below wraps independently.
+    const n = connected.nodes.length - isolatedIds.size;
+    if (n <= 1) return 1;
+    const A = containerSize.w > 0 && containerSize.h > 0 ? containerSize.w / containerSize.h : 16 / 9;
+    const cellW = NODE_W + SUBCOL_GAP;
+    const cellH = NODE_H + ROW_GAP;
+    const r = Math.round(Math.sqrt((n * cellW) / (A * cellH)));
+    return Math.max(1, Math.min(n, r));
+  }, [connected.nodes.length, isolatedIds, containerSize.w, containerSize.h, SUBCOL_GAP, ROW_GAP]);
 
   const generationLayouts = useMemo(() => {
-    type SubCol = { startX: number; ids: string[]; offset: number };
-    const layouts: Array<{
-      layer: number;
-      subCols: SubCol[];
-      genStartX: number;
-      genEndX: number;
-      colCount: number;
-    }> = [];
+    const layouts: Array<{ layer: number; ids: string[]; subColCount: number; genStartX: number; genEndX: number }> = [];
     let cursorX = PAD;
     orderedRows.forEach((row) => {
-      // Split row.ids across N sub-columns; brick-stagger alternating
-      // sub-columns by half a node height so neighbors don't form a
-      // perfect grid.
-      const nSub = Math.max(1, Math.ceil(row.ids.length / MAX_NODES_PER_SUBCOL));
-      const perSub = Math.ceil(row.ids.length / nSub);
-      const subCols: SubCol[] = [];
-      for (let s = 0; s < nSub; s += 1) {
-        const slice = row.ids.slice(s * perSub, (s + 1) * perSub);
-        subCols.push({
-          startX: cursorX + s * (NODE_W + SUBCOL_GAP),
-          ids: slice,
-          offset: s % 2 === 1 ? STAGGER_PX : 0,
-        });
-      }
-      const colCount = nSub;
+      const subColCount = Math.max(1, Math.ceil(row.ids.length / fillRows));
       const genStartX = cursorX;
-      const genEndX = cursorX + colCount * NODE_W + (colCount - 1) * SUBCOL_GAP;
-      layouts.push({ layer: row.layer, subCols, genStartX, genEndX, colCount });
-      cursorX = genEndX + COL_GAP;
+      const genEndX = genStartX + subColCount * NODE_W + (subColCount - 1) * SUBCOL_GAP;
+      layouts.push({ layer: row.layer, ids: row.ids, subColCount, genStartX, genEndX });
+      cursorX = genEndX + GEN_GAP;
     });
     return layouts;
-  }, [orderedRows, COL_GAP, SUBCOL_GAP]);
+  }, [orderedRows, fillRows, SUBCOL_GAP, GEN_GAP]);
 
   const positions = useMemo(() => {
     const pos: Record<string, { x: number; y: number }> = {};
-    // Vertical centering: find the tallest sub-column across the
-    // whole layout, then center smaller sub-columns to it.
-    let tallestPx = 0;
-    generationLayouts.forEach((g) =>
-      g.subCols.forEach((sc) => {
-        const px = sc.ids.length * NODE_H + (sc.ids.length - 1) * ROW_GAP;
-        if (px > tallestPx) tallestPx = px;
-      }),
-    );
     generationLayouts.forEach((g) => {
-      g.subCols.forEach((sc) => {
-        const colPx = sc.ids.length * NODE_H + (sc.ids.length - 1) * ROW_GAP;
-        const startY = PAD + (tallestPx - colPx) / 2 + sc.offset;
-        sc.ids.forEach((id, rowIdx) => {
-          pos[id] = {
-            x: sc.startX,
-            y: startY + rowIdx * (NODE_H + ROW_GAP),
-          };
-        });
+      g.ids.forEach((id, i) => {
+        const subcol = Math.floor(i / fillRows);
+        const r = i % fillRows;
+        pos[id] = {
+          x: g.genStartX + subcol * (NODE_W + SUBCOL_GAP),
+          y: TOP_MARGIN + PAD + r * (NODE_H + ROW_GAP),
+        };
       });
     });
+    // No-lineage band: wraps below the DAG (grows DOWN, never widens the
+    // generations), at least as wide as the DAG so the overall shape stays
+    // panel-like when the band dominates.
+    if (isolatedIds.size) {
+      const iso = connected.nodes
+        .filter((n) => isolatedIds.has(n.id))
+        .sort((a, b) => (a.title ?? a.id).localeCompare(b.title ?? b.id));
+      const cellW = NODE_W + SUBCOL_GAP;
+      const cellH = NODE_H + ROW_GAP;
+      const hasDag = generationLayouts.length > 0;
+      const dagWidth = hasDag
+        ? generationLayouts[generationLayouts.length - 1].genEndX - PAD
+        : 0;
+      const A = containerSize.w > 0 && containerSize.h > 0 ? containerSize.w / containerSize.h : 16 / 9;
+      const aspectCols = Math.ceil(Math.sqrt((iso.length * A * cellH) / cellW));
+      const cols = Math.max(1, Math.floor((dagWidth + SUBCOL_GAP) / cellW), aspectCols);
+      const dagBottom = hasDag
+        ? TOP_MARGIN + PAD + (fillRows - 1) * cellH + NODE_H
+        : TOP_MARGIN;
+      const startY = dagBottom + (hasDag ? BAND_GAP : PAD);
+      iso.forEach((n, i) => {
+        pos[n.id] = {
+          x: PAD + (i % cols) * cellW,
+          y: startY + Math.floor(i / cols) * cellH,
+        };
+      });
+    }
     return pos;
-  }, [generationLayouts, ROW_GAP]);
+  }, [generationLayouts, fillRows, SUBCOL_GAP, ROW_GAP, connected, isolatedIds, containerSize]);
 
   // -- Bounds for the SVG ---------------------------------------------
   const bounds = useMemo(() => {
@@ -953,6 +1189,25 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     };
   }, [positions]);
 
+  // Backdrop rect for the no-lineage band so it reads as its own region.
+  const bandBounds = useMemo(() => {
+    if (!isolatedIds.size) return null;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    isolatedIds.forEach((id) => {
+      const p = positions[id];
+      if (!p) return;
+      if (p.x < minX) minX = p.x;
+      if (p.x + NODE_W > maxX) maxX = p.x + NODE_W;
+      if (p.y < minY) minY = p.y;
+      if (p.y + NODE_H > maxY) maxY = p.y + NODE_H;
+    });
+    if (!Number.isFinite(minX)) return null;
+    return { minX, maxX, minY, maxY };
+  }, [isolatedIds, positions]);
+
   // -- Pan + zoom -----------------------------------------------------
   // `view` is what renders; `targetRef` is where zoom is heading. A rAF loop
   // eases view → target so wheel-zoom glides (and zooms toward the cursor)
@@ -964,6 +1219,28 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
   const draggingRef = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
   const draggedRef = useRef(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // Keep the panel size current so the grid can size itself to fill it.
+  // useLayoutEffect seeds the size synchronously BEFORE first paint, so
+  // fillRows never runs with the 16:9 fallback and rebuilds the whole
+  // layout once the ResizeObserver fires — the old double build.
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const w = el.clientWidth;
+      const h = el.clientHeight;
+      // Zero means hidden (the warm LEARN tab uses display:none); keep
+      // the last real size so the layout — and with it the user's
+      // pan/zoom — survives the hide/show round trip.
+      if (w <= 0 || h <= 0) return;
+      setContainerSize((cur) => (cur.w === w && cur.h === h ? cur : { w, h }));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Snap view + target together (Fit / Reset / autofit) — no animation.
   const setViewImmediate = React.useCallback((v: { x: number; y: number; k: number }) => {
@@ -995,6 +1272,12 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
   // Auto-fit on first mount + when bounds change so the whole tree
   // lands visible inside the modal regardless of how wide the widest
   // generation is. The "Fit" button re-runs this on demand.
+  // Read through a ref so opening/closing the inspector doesn't retrigger
+  // the auto-fit effect; a Fit PRESS still accounts for the open panel.
+  const selectedIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+  }, [selectedId]);
   const fitToView = React.useCallback(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -1003,14 +1286,20 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     const gw = bounds.maxX - bounds.minX;
     const gh = bounds.maxY - bounds.minY;
     if (cw <= 0 || ch <= 0 || gw <= 0 || gh <= 0) return;
-    const margin = 40;
+    // Reserve a top strip for the generation numbers, and the inspector's
+    // width when it is open (otherwise Fit tucks the rightmost generations
+    // underneath the panel), then scale to fill the rest. No 1.0 cap so a
+    // small graph zooms up.
+    const margin = 12;
+    const topReserve = 34;
+    const rightReserve = selectedIdRef.current ? 336 : 0;
     const k = Math.min(
-      (cw - margin) / gw,
-      (ch - margin) / gh,
-      1.0,
+      (cw - margin - rightReserve) / gw,
+      (ch - margin - topReserve) / gh,
+      4,
     );
-    const x = (cw - gw * k) / 2 - bounds.minX * k;
-    const y = (ch - gh * k) / 2 - bounds.minY * k;
+    const x = (cw - rightReserve - gw * k) / 2 - bounds.minX * k;
+    const y = topReserve + (ch - topReserve - gh * k) / 2 - bounds.minY * k;
     setViewImmediate({ x, y, k });
   }, [bounds, setViewImmediate]);
 
@@ -1018,6 +1307,13 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
   useEffect(() => {
     fitToView();
   }, [fitToView]);
+
+  // Publish Fit/Reset to the parent so they can live in the Lineage header.
+  useEffect(() => {
+    if (!controlsRef) return;
+    controlsRef.current = { fit: fitToView, reset: () => setViewImmediate({ x: 0, y: 0, k: 1 }) };
+    return () => { controlsRef.current = null; };
+  }, [controlsRef, fitToView, setViewImmediate]);
 
   // Esc closes the inspector.
   useEffect(() => {
@@ -1027,16 +1323,178 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     return () => window.removeEventListener('keydown', onKey);
   }, [selectedId]);
 
-  if (connected.nodes.length === 0) {
-    return (
-      <p className="absolute inset-0 flex items-center justify-center text-[10px] text-zinc-500 italic px-12 text-center">
-        No genealogy yet — entries become connected when you generate from
-        chimera sources, separate stems, convert to MIDI, or mark a
-        track as derived-from another. Right-click a track → "Show
-        lineage" to start populating relationships.
-      </p>
-    );
-  }
+  // Stems / MIDI nodes are titled "bass" / "piano" etc — show the TRACK they
+  // were derived from. Find a non-derived neighbor (the source track) and prefix
+  // its title.
+  const displayTitle = useCallback((n: GraphNode): string => {
+    const own = n.title ?? n.id;
+    const derived = (x?: GraphNode) =>
+      !!x && (x.source === 'stem' || x.source === 'midi' || x.kind === 'stem' || x.kind === 'midi');
+    if (!derived(n)) return own;
+    const nbrs = [...(parentsOf[n.id] ?? []), ...(childrenOf[n.id] ?? [])];
+    for (const id of nbrs) {
+      const src = nodeMap[id];
+      if (src && !derived(src) && src.title) return `${src.title} · ${own}`;
+    }
+    return own;
+  }, [parentsOf, childrenOf, nodeMap]);
+
+  // The whole SVG is memoized on graph/hover/selection/layout — NOT on `view`.
+  // Pan/zoom only updates the wrapper div's transform, so dragging/zooming no
+  // longer rebuilds hundreds of node/edge elements every frame (the old hot path).
+  const svgContent = useMemo(() => (
+    <svg
+      // Stable class hook for the imperative hover-glow effect below and
+      // its scoped CSS in index.css. 'gen-hovering' is toggled via
+      // classList only, so React never fights the imperative writes.
+      className="genealogy-svg"
+      width={bounds.maxX - bounds.minX}
+      height={bounds.maxY - bounds.minY}
+      viewBox={`${bounds.minX} ${bounds.minY} ${bounds.maxX - bounds.minX} ${bounds.maxY - bounds.minY}`}
+      style={{ display: 'block' }}
+    >
+      {/* Generation bands: plain alternating grey / darker-grey, spanning the
+          DAG only (they stop above the no-lineage band). The gen NUMBER lives
+          in a screen-space strip above the nodes (below the header). */}
+      {generationLayouts.map((g) => (
+        <rect
+          key={`genbg-${g.layer}`}
+          x={g.genStartX - GEN_GAP / 2}
+          y={bounds.minY}
+          width={g.genEndX - g.genStartX + GEN_GAP}
+          height={(bandBounds ? bandBounds.minY - BAND_GAP / 2 : bounds.maxY) - bounds.minY}
+          fill={g.layer % 2 === 0 ? '#17171c' : '#0d0d11'}
+        />
+      ))}
+      {/* No-lineage band backdrop: its own region below the family tree. */}
+      {bandBounds && (
+        <rect
+          x={bandBounds.minX - PAD / 2}
+          y={bandBounds.minY - PAD / 2}
+          width={bandBounds.maxX - bandBounds.minX + PAD}
+          height={bandBounds.maxY - bandBounds.minY + PAD}
+          rx={10}
+          ry={10}
+          fill="#101018"
+        />
+      )}
+
+      {/* Edges under nodes. Rendered hover-INDEPENDENT: nothing here fades or
+          rebuilds when the cursor moves. Hover glow lands imperatively on these
+          same elements via the lineage-glow effect below (keyed by the data-*
+          attributes), so off-path filaments stay fully visible. */}
+      {connected.edges.map((edge, i) => {
+        const from = positions[edge.from_id];
+        const to = positions[edge.to_id];
+        if (!from || !to) return null;
+        const x1 = from.x + NODE_W;
+        const y1 = from.y + NODE_H / 2;
+        const x2 = to.x;
+        const y2 = to.y + NODE_H / 2;
+        const dx = (x2 - x1) * 0.5;
+        const d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
+        const color = EDGE_COLOR_BY_KIND[edge.kind] ?? '#71717a';
+        // No inline transition on this <g>: glow classes must apply and
+        // clear in one frame (transitioned filters caused a repaint storm).
+        return (
+          <g
+            key={i}
+            opacity={0.85}
+            data-edge-from={edge.from_id}
+            data-edge-to={edge.to_id}
+            data-edge-color={color}
+          >
+            <GenEdgeBody d={d} color={color} x2={x2} y2={y2} strong={false} />
+          </g>
+        );
+      })}
+
+      {/* Nodes, also hover-independent (only selection re-renders). */}
+      {connected.nodes.map((n) => {
+        const p = positions[n.id];
+        if (!p) return null;
+        const sourceColor = pickNodeColor(n);
+        const isSelected = selectedId === n.id;
+        const isHighlighted = highlightSet?.has(n.id) ?? false;
+        return (
+          <g
+            key={n.id}
+            transform={`translate(${p.x}, ${p.y})`}
+            data-node-id={n.id}
+            data-node-color={sourceColor}
+            style={{ cursor: 'pointer' }}
+            onMouseEnter={() => enterNode(n.id)}
+            onMouseLeave={leaveNode}
+            onClick={(e) => {
+              e.stopPropagation();
+              if (draggedRef.current) return;
+              setSelectedId((cur) => (cur === n.id ? null : n.id));
+            }}
+          >
+            <GenNodeBody n={n} title={displayTitle(n)} sourceColor={sourceColor} strong={isSelected || isHighlighted} w={NODE_W} h={NODE_H} />
+            {isHighlighted && (
+              <rect
+                width={NODE_W}
+                height={NODE_H}
+                rx={6}
+                ry={6}
+                fill="none"
+                stroke="#fbbf24"
+                strokeWidth={2.5}
+                pointerEvents="none"
+              />
+            )}
+          </g>
+        );
+      })}
+    </svg>
+  ), [bounds, bandBounds, generationLayouts, GEN_GAP, connected, positions, selectedId, enterNode, leaveNode, displayTitle, highlightSet]);
+
+  // Lineage hover glow, applied imperatively. The SVG above is referentially
+  // stable across hover changes (hover is NOT in its memo deps), so React never
+  // touches the mounted graph while the mouse moves. Instead of writing inline
+  // filter strings, the effect toggles classes + a --glow custom property (the
+  // rules live in index.css, all transition-free so the glow lands in ONE
+  // frame): 'gen-hovering' on the svg root dims everything off-lineage,
+  // 'gen-lit' + --glow lights each lineage node/edge <g>, and 'gen-lit-hot'
+  // marks the hovered node itself. Edge glow is stroke-based only — a
+  // drop-shadow on a bezier edge's <g> creates a filter surface spanning
+  // thousands of px, which Chromium drops/checkerboards (edges visibly
+  // flashed out of existence). litRef tracks exactly the touched elements so
+  // cleanup restores only them; svgContent stays in the deps so the glow
+  // re-applies onto freshly mounted elements after a rebuild.
+  const litRef = useRef<SVGGElement[]>([]);
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const svg = el.querySelector<SVGSVGElement>('svg.genealogy-svg');
+    litRef.current.forEach((g) => {
+      g.classList.remove('gen-lit', 'gen-lit-hot');
+      g.style.removeProperty('--glow');
+    });
+    litRef.current = [];
+    svg?.classList.remove('gen-hovering');
+    if (!hovered || !svg) return;
+    svg.classList.add('gen-hovering');
+    const lit: SVGGElement[] = [];
+    el.querySelectorAll<SVGGElement>('g[data-node-id]').forEach((g) => {
+      const id = g.dataset.nodeId as string;
+      if (!lineage.has(id)) return;
+      g.style.setProperty('--glow', g.dataset.nodeColor || '#a78bfa');
+      g.classList.add('gen-lit');
+      if (id === hovered) g.classList.add('gen-lit-hot');
+      lit.push(g);
+    });
+    el.querySelectorAll<SVGGElement>('g[data-edge-from]').forEach((g) => {
+      const from = g.dataset.edgeFrom as string;
+      const to = g.dataset.edgeTo as string;
+      if (!lineage.has(from) || !lineage.has(to)) return;
+      g.style.setProperty('--glow', g.dataset.edgeColor || '#a78bfa');
+      g.classList.add('gen-lit');
+      lit.push(g);
+    });
+    litRef.current = lit;
+  }, [hovered, lineage, svgContent]);
 
   // Wheel listener must be attached non-passively so we can preventDefault
   // and stop the parent (Shell) from scrolling. React's JSX wheel handler
@@ -1067,6 +1525,24 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
     el.addEventListener('wheel', onNativeWheel, { passive: false });
     return () => el.removeEventListener('wheel', onNativeWheel);
   }, [kick]);
+
+  // This early return must sit BELOW every hook in the component. The
+  // warm-mounted LEARN tab refetches the library graph in place, so
+  // connected.nodes.length can flip between zero and non-zero on an
+  // already-mounted component; a conditional return above any hook would
+  // then change the hook count between renders and React would tear down
+  // the whole tree ("Rendered more/fewer hooks than during the previous
+  // render").
+  if (connected.nodes.length === 0) {
+    return (
+      <p className="absolute inset-0 flex items-center justify-center text-[10px] text-zinc-500 italic px-12 text-center">
+        No genealogy yet — entries become connected when you generate from
+        chimera sources, separate stems, convert to MIDI, or mark a
+        track as derived-from another. Right-click a track → "Show
+        lineage" to start populating relationships.
+      </p>
+    );
+  }
 
   // Pan: capture only once a real drag begins (>4px) so a plain click still
   // reaches a node's onClick. `draggedRef` suppresses the click that ends a drag.
@@ -1106,21 +1582,22 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
       onPointerUp={onPointerUp}
       onClick={() => { if (!draggedRef.current) setSelectedId(null); }}
     >
-      <div className="absolute top-2 right-2 z-10 flex gap-1">
-        <button
-          onClick={fitToView}
-          className="text-[9px] font-mono uppercase tracking-widest text-zinc-300 hover:text-purple-200 bg-purple-500/15 border border-purple-500/30 hover:border-purple-400/60 px-2 py-1 rounded flex items-center gap-1"
-          title="Fit the entire genealogy into the viewport"
-        >
-          <Maximize className="w-2.5 h-2.5" /> Fit
-        </button>
-        <button
-          onClick={() => setViewImmediate({ x: 0, y: 0, k: 1 })}
-          className="text-[9px] font-mono uppercase tracking-widest text-zinc-400 hover:text-zinc-200 bg-black/40 border border-white/10 px-2 py-1 rounded"
-          title="Reset to native scale"
-        >
-          Reset
-        </button>
+      {/* Generation numbers — a screen-space strip just below the header that
+          tracks the canvas horizontally so each number floats above its
+          generation's column. Fit reserves the top margin so these stay clear. */}
+      <div className="absolute top-0 left-0 right-0 h-8 z-10 overflow-hidden pointer-events-none">
+        {generationLayouts.map((g) => {
+          const centerX = ((g.genStartX + g.genEndX) / 2) * view.k + view.x;
+          return (
+            <span
+              key={g.layer}
+              className="absolute top-2 -translate-x-1/2 text-[12px] font-mono font-bold tracking-widest text-zinc-300"
+              style={{ left: centerX }}
+            >
+              {g.layer}
+            </span>
+          );
+        })}
       </div>
 
       <div
@@ -1129,108 +1606,12 @@ const GenealogyView: React.FC<{ payload: GraphPayload; appearance: GraphAppearan
           transformOrigin: '0 0',
         }}
       >
-        <svg
-          width={bounds.maxX - bounds.minX}
-          height={bounds.maxY - bounds.minY}
-          viewBox={`${bounds.minX} ${bounds.minY} ${bounds.maxX - bounds.minX} ${bounds.maxY - bounds.minY}`}
-          style={{ display: 'block' }}
-        >
-          {/* Per-generation background bands: a subtle, alternating shade behind
-              each generation's nodes so the gen-0 / gen-1 / … columns read as
-              distinct zones (gentle variations of the canvas color). */}
-          {generationLayouts.map((g) => (
-            <rect
-              key={`genbg-${g.layer}`}
-              x={g.genStartX - appearance.colGap / 2}
-              y={bounds.minY}
-              width={g.genEndX - g.genStartX + appearance.colGap}
-              height={bounds.maxY - bounds.minY}
-              fill={`hsl(258 38% ${3.4 + (g.layer % 2) * 2.4}%)`}
-            />
-          ))}
-
-          {/* Edges next so nodes paint on top. Flow is left-to-right:
-              parent on the left, child on the right of the next column. */}
-          {connected.edges.map((edge, i) => {
-            const from = positions[edge.from_id];
-            const to = positions[edge.to_id];
-            if (!from || !to) return null;
-            const x1 = from.x + NODE_W;          // parent's right edge
-            const y1 = from.y + NODE_H / 2;
-            const x2 = to.x;                      // child's left edge
-            const y2 = to.y + NODE_H / 2;
-            // Smooth cubic Bezier curving across the column gap.
-            const dx = (x2 - x1) * 0.5;
-            const d = `M ${x1} ${y1} C ${x1 + dx} ${y1}, ${x2 - dx} ${y2}, ${x2} ${y2}`;
-            const color = EDGE_COLOR_BY_KIND[edge.kind] ?? '#71717a';
-            // Lineage hover: an edge is "on the path" when both endpoints are in
-            // the highlighted set; off-path edges fade right back.
-            const onPath = lineage.has(edge.from_id) && lineage.has(edge.to_id);
-            const eOp = !hovered ? 1 : onPath ? 1 : 0.06;
-            return (
-              <g key={i} opacity={eOp} style={{ transition: `opacity ${LINEAGE_FADE_MS}ms cubic-bezier(0.4, 0, 0.2, 1)` }}>
-                <GenEdgeBody d={d} color={color} x2={x2} y2={y2} strong={!!hovered && onPath} />
-              </g>
-            );
-          })}
-
-          {/* Nodes. */}
-          {connected.nodes.map((n) => {
-            const p = positions[n.id];
-            if (!p) return null;
-            const sourceColor = pickNodeColor(n);
-            const onPath = lineage.has(n.id);
-            const nOp = !hovered ? 1 : lineageOpacity(onPath);
-            const isHovered = hovered === n.id;
-            const isSelected = selectedId === n.id;
-            return (
-              <g
-                key={n.id}
-                transform={`translate(${p.x}, ${p.y})`}
-                opacity={nOp}
-                style={{ cursor: 'pointer', transition: `opacity ${LINEAGE_FADE_MS}ms cubic-bezier(0.4, 0, 0.2, 1)` }}
-                onMouseEnter={() => enterNode(n.id)}
-                onMouseLeave={leaveNode}
-                onClick={(e) => {
-                  e.stopPropagation();
-                  // Suppress the click that ends a pan-drag.
-                  if (draggedRef.current) return;
-                  setSelectedId((cur) => (cur === n.id ? null : n.id));
-                }}
-              >
-                <GenNodeBody n={n} sourceColor={sourceColor} strong={isHovered || isSelected} w={NODE_W} h={NODE_H} />
-              </g>
-            );
-          })}
-        </svg>
-      </div>
-
-      {/* Generation column headers — each one spans its (possibly
-          multi-sub-column) generation width and follows the canvas in
-          screen-space so they don't pan/zoom with content. */}
-      <div className="absolute top-0 left-0 z-10 text-[9px] font-mono uppercase tracking-widest text-zinc-500 pointer-events-none">
-        {generationLayouts.map((g) => {
-          const centerWorldX = (g.genStartX + g.genEndX) / 2;
-          return (
-            <div
-              key={g.layer}
-              style={{
-                position: 'absolute',
-                left: centerWorldX * view.k + view.x,
-                top: 8,
-                transform: 'translateX(-50%)',
-              }}
-              className="bg-purple-500/20 border border-purple-500/40 rounded px-2 py-0.5 text-purple-200"
-            >
-              gen {g.layer}
-            </div>
-          );
-        })}
+        {svgContent}
       </div>
 
       {/* Help hint */}
       <div className="absolute bottom-2 left-2 z-10 text-[8px] font-mono text-zinc-600 pointer-events-none">
-        drag to pan · wheel to zoom · click a node for details · {connected.nodes.length} connected entries · {connected.edges.length} relationships
+        drag to pan · wheel to zoom · click a node for details · {connected.nodes.length} entries · {connected.edges.length} relationships
       </div>
 
       {/* Detail / analytics inspector (screen-space; outside the pan/zoom transform). */}
@@ -1484,26 +1865,55 @@ const SelectRow: React.FC<{ label: string; value: string; options: Array<{ value
 );
 
 
+/** Frees the geometries and materials under a detached overlay group
+ *  (cluster halos). three.js objects hold GPU resources that are not
+ *  garbage-collected on scene removal; they must be disposed explicitly. */
+function disposeLineageGroup(group: { traverse?: (cb: (o: unknown) => void) => void }) {
+  group.traverse?.((o) => {
+    const m = o as { geometry?: { dispose?: () => void }; material?: { dispose?: () => void } };
+    m.geometry?.dispose?.();
+    m.material?.dispose?.();
+  });
+}
+
+// ONE shared geometry + ONE shared invisible material back every node's
+// enlarged hover hit-proxy sphere (see the nodeThreeObject builder).
+// Module-cached so rebuilds never re-allocate them. The material is
+// invisible rather than transparent: three's raycaster still intersects
+// it (Mesh.raycast only skips undefined materials, and the recursive
+// traversal checks layers, not visibility) while the renderer skips
+// drawing it entirely. It deliberately carries NO userData.baseOpacity
+// so the lineage glow tween ignores the proxy meshes.
+let hitProxyGeo: import('three').SphereGeometry | null = null;
+let hitProxyMat: import('three').MeshBasicMaterial | null = null;
+
 /** Interactive 3D force-directed graph using react-force-graph-3d.
  *  Camera auto-fits to the connected subgraph on first render so the
  *  user lands on something usable instead of a dot in the distance.
- *  Appearance controlled via the AppearancePanel side drawer. */
-const Graph3DView: React.FC<{
+ *  Appearance controlled via the AppearancePanel side drawer.
+ *  Memoized: the parent re-renders on unrelated state (e.g. the silent
+ *  library-graph refresh toggling `loading`), and any re-render with
+ *  fresh accessor prop identities makes the library rebuild scene
+ *  objects wholesale — React.memo keeps those renders away entirely. */
+const Graph3DView = React.memo(function Graph3DViewBase({ payload, highlight, appearance, visible = true, highlightSet, searchNeedle = '' }: {
   payload: GraphPayload;
   highlight: string | null;
   appearance: GraphAppearance;
-}> = ({ payload, highlight, appearance }) => {
-  // Same filter as Genealogy: drop nodes that don't participate in any
-  // relation, otherwise 100+ disconnected dots dominate the view.
+  /** Mirrors whether the warm-mounted host tab is shown. The wrapper
+   *  hides this view with display:none instead of unmounting it, so the
+   *  render loops below must be paused explicitly while hidden. */
+  visible?: boolean;
+  /** Nodes to render amber (header MOST/LEAST/PLAYS toggles + search). */
+  highlightSet?: Set<string>;
+  /** Debounced, lowercased title-search needle from the modal header —
+   *  non-matching nodes/edges are dimmed. Empty disables the filter. */
+  searchNeedle?: string;
+}) {
+  // Same input as Genealogy: ALL nodes, including lineage-less tracks —
+  // they float as unlinked dots so the graph shows the whole library.
   const connected = useMemo(() => {
-    const involved = new Set<string>();
     const allEdges = payload?.edges ?? [];
-    const allNodes = payload?.nodes ?? [];
-    allEdges.forEach((e) => {
-      involved.add(e.from_id);
-      involved.add(e.to_id);
-    });
-    const nodes = allNodes.filter((n) => involved.has(n.id));
+    const nodes = payload?.nodes ?? [];
     const idSet = new Set(nodes.map((n) => n.id));
     const edges = allEdges.filter(
       (e) => idSet.has(e.from_id) && idSet.has(e.to_id),
@@ -1511,27 +1921,10 @@ const Graph3DView: React.FC<{
     return { nodes, edges };
   }, [payload]);
 
-  // Graphrag-workbench-style search: when the query is non-empty, nodes
-  // whose name/prompt/model don't substring-match are visually muted
-  // (gray, low alpha) and their incident edges are dimmed. Empty query
-  // disables the filter. Matching is case-insensitive.
-  //
-  // The needle is debounced (~150ms) so per-keystroke typing doesn't
-  // re-mount Three.js node groups via the `data` useMemo below — on
-  // larger graphs that mid-typing churn is what causes the search input
-  // to feel sluggish. Empty query clears immediately so the user sees
-  // the unfiltered graph as soon as they hit backspace through the box.
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchNeedle, setSearchNeedle] = useState('');
-  useEffect(() => {
-    const trimmed = searchQuery.trim().toLowerCase();
-    if (!trimmed) {
-      setSearchNeedle('');
-      return;
-    }
-    const handle = window.setTimeout(() => setSearchNeedle(trimmed), 150);
-    return () => window.clearTimeout(handle);
-  }, [searchQuery]);
+  // Graphrag-workbench-style search: when the needle (debounced in the
+  // modal header, which owns the input) is non-empty, nodes whose
+  // name/prompt/model don't substring-match are visually muted (gray,
+  // low alpha) and their incident edges are dimmed.
   const matchSet = useMemo(() => {
     if (!searchNeedle) return null;
     const out = new Set<string>();
@@ -1546,7 +1939,8 @@ const Graph3DView: React.FC<{
     () => ({
       nodes: connected.nodes.map((n) => {
         const isMatch = matchSet === null || matchSet.has(n.id);
-        const baseColor = n.id === highlight ? '#fbbf24' : pickNodeColor(n);
+        const isAccented = n.id === highlight || (highlightSet?.has(n.id) ?? false);
+        const baseColor = isAccented ? '#fbbf24' : pickNodeColor(n);
         return {
           id: n.id,
           name: n.title ?? n.id,
@@ -1572,7 +1966,7 @@ const Graph3DView: React.FC<{
         };
       }),
     }),
-    [connected, highlight, appearance.nodeSizeScale, matchSet],
+    [connected, highlight, highlightSet, appearance.nodeSizeScale, matchSet],
   );
   // react-force-graph mutates these node objects in place with x/y/z during
   // layout; the flight loop reads them through this ref for the cluster center.
@@ -1581,6 +1975,49 @@ const Graph3DView: React.FC<{
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const fgRef = useRef<any>(null);
+
+  // Two-state load: three is lazy-imported so 2D users don't pay its
+  // bundle cost. Until it resolves, the component renders the engine-
+  // loading note INSTEAD of <ForceGraph3D> — mounting the graph earlier
+  // made nodeThreeObject return undefined for the first frames, so the
+  // library drew its default spheres (nodeRelSize 7, ~7x larger than
+  // the custom meshes) and then rebuilt everything post-import.
+  const threeRef = useRef<typeof import('three') | null>(null);
+  const [threeReady, setThreeReady] = useState(false);
+  useEffect(() => {
+    if (appearance.renderMode !== '3d') return;
+    let cancelled = false;
+    void import('three').then((mod) => {
+      threeRef.current = mod;
+      if (!cancelled) setThreeReady(true);
+    });
+    return () => { cancelled = true; };
+  }, [appearance.renderMode]);
+
+  // Explicit canvas size, measured from the container. Without these
+  // props react-force-graph sizes itself once from the window, so the
+  // canvas neither matches the hosting panel nor survives the
+  // fullscreen toggle. getBoundingClientRect works under the counter-
+  // zoomed embed (effective scale 1) and in the portaled paths alike.
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [dims, setDims] = useState({ w: 0, h: 0 });
+  useLayoutEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      const w = Math.round(r.width);
+      const h = Math.round(r.height);
+      // Zero means hidden (warm tab display:none); keep the last real
+      // size so the canvas is not collapsed and re-expanded.
+      if (w <= 0 || h <= 0) return;
+      setDims((cur) => (cur.w === w && cur.h === h ? cur : { w, h }));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Hover state. Stored as state so the useEffect below can run a
   // Three.js scene traversal to dim per-node meshes on each hover
@@ -1665,11 +2102,42 @@ const Graph3DView: React.FC<{
     [hoveredId, dirAdj],
   );
 
-  // Node-mesh dimming on hover. Walks the Three.js scene; each node
-  // group has been tagged with userData.nodeId by nodeThreeObject, and
-  // its materials carry userData.baseOpacity. When a node is hovered,
-  // non-neighbor groups drop to baseOpacity * 0.15; everything snaps
-  // back to baseOpacity when the cursor leaves.
+  // Node-mesh lineage GLOW on hover. Each node group is tagged with
+  // userData.nodeId by nodeThreeObject and its materials carry
+  // userData.baseOpacity. Non-lineage nodes stay at base opacity (nothing
+  // disappears when the cursor moves); the hovered node and its lineage
+  // brighten instead. The scene is traversed ONCE per hover change to collect
+  // node meshes; the rAF tween then touches only that list until it settles.
+  //
+  // Lineage LINKS thicken 2.6x here too, imperatively: the linkWidth prop
+  // must stay a stable number because any linkWidth identity change makes
+  // three-forcegraph rebuild every link object from scratch. Straight
+  // links are unit cylinders whose radius is baked into a shared geometry
+  // and stretched via scale.z + lookAt — the library never writes
+  // scale.x/y, so a radial scale composes cleanly. Curved links are
+  // per-link TubeGeometry with the radius baked in; those are rebuilt in
+  // place with the boosted radius (matching what the library itself does
+  // on every position update). thickenedRef remembers exactly what was
+  // touched so the next hover change restores the base look first.
+  const thickenedRef = useRef<Array<{
+    mesh: {
+      parent?: unknown;
+      scale: { x: number; y: number };
+      geometry: { dispose?: () => void; type?: string };
+    };
+    mode: 'scale' | 'tube';
+    curve?: import('three').Curve<import('three').Vector3> | null;
+    baseRadius?: number;
+    /** The link record itself, kept so the 10Hz repair in the flight
+     *  loop can rebuild from the link's CURRENT curve after the engine
+     *  moves the nodes (the curve stored at hover time goes stale). */
+    link?: { __curve?: import('three').Curve<import('three').Vector3> | null };
+    /** The exact boosted TubeGeometry this code installed. The engine's
+     *  layout tick rebuilds curved-link tubes at base radius during
+     *  cooldown; a geometry identity mismatch is the cheap signal that
+     *  the boost was erased and must be re-applied. */
+    boostedGeo?: unknown;
+  }>>([]);
   useEffect(() => {
     if (appearance.renderMode !== '3d') return;
     type SceneLike = { traverse: (cb: (obj: unknown) => void) => void };
@@ -1678,15 +2146,67 @@ const Graph3DView: React.FC<{
       material?: { opacity?: number; userData?: { baseOpacity?: number } };
       parent?: { userData?: { nodeId?: string } };
     };
-    // Ease each mesh's opacity toward its lineage target (no flash). Runs a
-    // rAF until everything settles, then stops; a hover change re-runs the
-    // effect and restarts the tween toward the new targets.
+    const THREE = threeRef.current;
+    // Restore the previous hover's thickened links before lighting the
+    // next set so a hover move never strands a thick link. The rebuild
+    // prefers the link's CURRENT curve: the engine may have moved the
+    // nodes since the hover started, and the curve captured at hover
+    // time would place the restored tube at stale positions.
+    for (const t of thickenedRef.current) {
+      if (!t.mesh.parent) continue; // already removed by a rebuild
+      if (t.mode === 'scale') {
+        t.mesh.scale.x = 1;
+        t.mesh.scale.y = 1;
+      } else if (THREE && typeof t.baseRadius === 'number') {
+        const curve = t.link?.__curve ?? t.curve;
+        if (curve) {
+          t.mesh.geometry.dispose?.();
+          (t.mesh as { geometry: unknown }).geometry = new THREE.TubeGeometry(curve, 30, t.baseRadius, 6, false);
+        }
+      }
+    }
+    thickenedRef.current = [];
+    if (hoveredId && THREE) {
+      // Mirror the library's width rounding so the restored tube radius
+      // is byte-identical to what a fresh layout pass would build.
+      const baseRadius = Math.ceil(appearance.linkWidth * 10) / 10 / 2;
+      type LinkLike = {
+        source?: { id?: string } | string;
+        target?: { id?: string } | string;
+        __lineObj?: { children?: unknown[]; isMesh?: boolean };
+        __curve?: import('three').Curve<import('three').Vector3> | null;
+      };
+      for (const l of dataRef.current.links as unknown as LinkLike[]) {
+        const srcId = typeof l.source === 'object' ? l.source?.id : l.source;
+        const tgtId = typeof l.target === 'object' ? l.target?.id : l.target;
+        if (!lineage.has(srcId ?? '') || !lineage.has(tgtId ?? '')) continue;
+        const lineObj = l.__lineObj;
+        const mesh = (lineObj?.children?.length ? lineObj.children[0] : lineObj) as {
+          isMesh?: boolean;
+          parent?: unknown;
+          scale: { x: number; y: number };
+          geometry?: { dispose?: () => void; type?: string };
+        } | undefined;
+        if (!mesh?.isMesh || !mesh.geometry) continue;
+        if (/^Cylinder/.test(mesh.geometry.type ?? '')) {
+          mesh.scale.x = 2.6;
+          mesh.scale.y = 2.6;
+          thickenedRef.current.push({ mesh: mesh as never, mode: 'scale' });
+        } else if (/^Tube/.test(mesh.geometry.type ?? '') && l.__curve) {
+          mesh.geometry.dispose?.();
+          const boosted = new THREE.TubeGeometry(l.__curve, 30, baseRadius * 2.6, 6, false);
+          (mesh as { geometry: unknown }).geometry = boosted;
+          thickenedRef.current.push({ mesh: mesh as never, mode: 'tube', curve: l.__curve, baseRadius, link: l, boostedGeo: boosted });
+        }
+      }
+    }
     let raf = 0;
-    const apply = () => {
+    let meshes: Array<{ m: MeshLike; target: number }> | null = null;
+    const collect = (): boolean => {
       const ref = fgRef.current as { scene?: () => unknown } | null;
       const scene = ref?.scene?.() as SceneLike | undefined;
-      if (!scene || typeof scene.traverse !== 'function') { raf = requestAnimationFrame(apply); return; }
-      let animating = false;
+      if (!scene || typeof scene.traverse !== 'function') return false;
+      const list: Array<{ m: MeshLike; target: number }> = [];
       scene.traverse((obj: unknown) => {
         const m = obj as MeshLike;
         if (!m.isMesh || !m.material) return;
@@ -1694,28 +2214,55 @@ const Graph3DView: React.FC<{
         if (typeof base !== 'number') return;
         const ownerId = m.parent?.userData?.nodeId;
         if (!ownerId) return;
-        const target = !hoveredId ? base : base * lineageOpacity(lineage.has(ownerId));
-        const cur = m.material.opacity ?? base;
+        const boost = hoveredId && lineage.has(ownerId) ? (ownerId === hoveredId ? 2.2 : 1.7) : 1;
+        list.push({ m, target: Math.min(1, base * boost) });
+      });
+      meshes = list;
+      return true;
+    };
+    const apply = () => {
+      if (!meshes && !collect()) { raf = requestAnimationFrame(apply); return; }
+      let animating = false;
+      for (const { m, target } of meshes!) {
+        if (!m.material) continue;
+        const cur = m.material.opacity ?? target;
         const diff = target - cur;
-        if (Math.abs(diff) < 0.004) { m.material.opacity = target; return; }
+        if (Math.abs(diff) < 0.004) { m.material.opacity = target; continue; }
         m.material.opacity = cur + diff * 0.028;
         animating = true;
-      });
+      }
       raf = animating ? requestAnimationFrame(apply) : 0;
     };
     raf = requestAnimationFrame(apply);
     return () => { if (raf) cancelAnimationFrame(raf); };
-  }, [hoveredId, lineage, appearance.renderMode, data]);
+  }, [hoveredId, lineage, appearance.renderMode, appearance.linkWidth, data]);
 
-  // Fit-to-view at three checkpoints so we catch both early- and late-
-  // settling force layouts. Without this the camera lingers at its
-  // default position and the user sees one disconnected dot far off
-  // in z-space.
+  // ONE fit-to-view per (re)layout, fired on the first onEngineStop with
+  // a fallback timer in case the engine is already cold. The old triple
+  // 350/1200/2500ms timeout visibly re-framed an on-screen graph twice;
+  // combined with warmupTicks (the layout settles before first paint)
+  // the framing now lands in a single move. Without any fit the camera
+  // lingers at its default position and the user sees one disconnected
+  // dot far off in z-space.
   //
   // Tighter padding (was 80 → 12) so the cluster fills the viewport.
   // d3Force tweaks pull nodes closer: weaker repulsive charge (was
   // ~-300 default → -90) and shorter link distance (was ~30 default →
   // 18) trade out-of-cluster breathing room for in-cluster density.
+  const fitDoneRef = useRef(false);
+  const runInitialFit = useCallback(() => {
+    if (fitDoneRef.current) return;
+    const r = fgRef.current as {
+      zoomToFit?: (ms: number, pad: number) => void;
+      centerAt?: (x: number, y: number, ms: number) => void;
+    } | null;
+    // Leave the fit pending while the graph is not mounted yet (the
+    // two-state load gate) so a later engine stop can still claim it.
+    if (!r?.zoomToFit) return;
+    fitDoneRef.current = true;
+    r.zoomToFit(600, 12);
+    if (r.centerAt) r.centerAt(0, 0, 600);
+  }, []);
   useEffect(() => {
     const ref = fgRef.current as {
       d3Force?: (forceName: string) => {
@@ -1727,18 +2274,10 @@ const Graph3DView: React.FC<{
       ref.d3Force('charge')?.strength?.(appearance.charge);
       ref.d3Force('link')?.distance?.(appearance.linkDistance);
     }
-    const timeouts = [350, 1200, 2500].map((ms) =>
-      setTimeout(() => {
-        const r = fgRef.current as {
-          zoomToFit?: (ms: number, pad: number) => void;
-          centerAt?: (x: number, y: number, ms: number) => void;
-        } | null;
-        if (r?.zoomToFit) r.zoomToFit(600, 12);
-        if (r?.centerAt) r.centerAt(0, 0, 600);
-      }, ms),
-    );
-    return () => timeouts.forEach(clearTimeout);
-  }, [data, appearance.renderMode, appearance.vizPreset, appearance.charge, appearance.linkDistance]);
+    fitDoneRef.current = false;
+    const fallback = setTimeout(runInitialFit, 2000);
+    return () => clearTimeout(fallback);
+  }, [data, appearance.renderMode, appearance.vizPreset, appearance.charge, appearance.linkDistance, threeReady, runInitialFit]);
 
   // Cluster tint: when ON (and 3D), add a translucent halo sphere
   // centered on each per-source centroid so the user can see source-
@@ -1761,7 +2300,11 @@ const Graph3DView: React.FC<{
       | null;
     if (!scene?.add) return;
     const prior = scene.getObjectByName?.('__lineage_clusters__');
-    if (prior) scene.remove?.(prior);
+    if (prior) {
+      scene.remove?.(prior);
+      // Each rebuild allocates fresh halo spheres; free the old ones.
+      disposeLineageGroup(prior);
+    }
 
     // react-force-graph stores resolved positions on the node objects
     // themselves (x/y/z). After settle they're populated.
@@ -1837,7 +2380,10 @@ const Graph3DView: React.FC<{
         | null;
       if (scene) {
         const prior = scene.getObjectByName?.('__lineage_clusters__');
-        if (prior) scene.remove?.(prior);
+        if (prior) {
+          scene.remove?.(prior);
+          disposeLineageGroup(prior);
+        }
       }
       return;
     }
@@ -1857,7 +2403,10 @@ const Graph3DView: React.FC<{
           })
         | null;
       const prior = scene?.getObjectByName?.('__lineage_clusters__');
-      if (prior && scene?.remove) scene.remove(prior);
+      if (prior && scene?.remove) {
+        scene.remove(prior);
+        disposeLineageGroup(prior);
+      }
     };
   }, [appearance.clusterColoring, appearance.renderMode, rebuildClusterHalos]);
 
@@ -1867,24 +2416,37 @@ const Graph3DView: React.FC<{
   //
   // Wrapped in a deferred handle so the heavy 1500-point geometry build
   // doesn't block the React commit phase — that pile-on is what triggers
-  // "[Violation] 'message' handler took Xms" on initial modal open.
+  // "[Violation] 'message' handler took Xms" on initial modal open. The
+  // deferral window is short (100ms) and the setup retries until the
+  // scene exists, so background + nodes + framing appear together
+  // instead of the stars trailing in seconds later (the old code both
+  // waited 500ms and silently gave up when the scene wasn't ready yet).
   useEffect(() => {
     if (appearance.renderMode !== '3d') return;
     let teardown: (() => void) | null = null;
     let cancelled = false;
+    let retryTimer: number | null = null;
+    let attempts = 0;
     type IdleCb = (cb: () => void, opts?: { timeout: number }) => number;
     const ric = (window as unknown as { requestIdleCallback?: IdleCb }).requestIdleCallback;
     const schedule = (fn: () => void) => {
-      if (typeof ric === 'function') ric(fn, { timeout: 500 });
+      if (typeof ric === 'function') ric(fn, { timeout: 100 });
       else setTimeout(fn, 0);
     };
-    schedule(() => {
+    const trySetup = () => {
       if (cancelled) return;
       const setup = setupStarfield();
-      if (setup) teardown = setup;
-    });
+      if (setup) {
+        teardown = setup;
+        return;
+      }
+      attempts += 1;
+      if (attempts < 40) retryTimer = window.setTimeout(trySetup, 50);
+    };
+    schedule(trySetup);
     return () => {
       cancelled = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
       teardown?.();
     };
 
@@ -1955,7 +2517,9 @@ const Graph3DView: React.FC<{
       starsMat.dispose();
     };
     }
-  }, [appearance.renderMode, appearance.vizPreset, data]);
+    // threeReady re-runs the setup once the graph actually mounts (the
+    // two-state load gate keeps the scene from existing before then).
+  }, [appearance.renderMode, appearance.vizPreset, data, threeReady]);
 
   // Tron-grid preset: lay a glowing ground GridHelper under the nodes,
   // injected straight into the Three.js scene (like the starfield) and
@@ -1992,6 +2556,8 @@ const Graph3DView: React.FC<{
       teardown = () => {
         scene.remove(grid);
         grid.geometry.dispose();
+        // GridHelper's LineBasicMaterial holds GPU resources too.
+        mat.dispose();
       };
     };
     const t = setTimeout(() => void run(), 400);
@@ -2001,7 +2567,9 @@ const Graph3DView: React.FC<{
       teardown?.();
       removeExisting();
     };
-  }, [appearance.renderMode, appearance.vizPreset, data]);
+    // threeReady re-runs the injection once the graph mounts (before it
+    // the scene doesn't exist and run() would silently no-op).
+  }, [appearance.renderMode, appearance.vizPreset, data, threeReady]);
 
   // Selection "handle": scale the selected node's group up so both the
   // click target and the visual selection read clearly. Walks the scene
@@ -2026,6 +2594,22 @@ const Graph3DView: React.FC<{
     });
   }, [selectedId, appearance.renderMode, data]);
 
+  // The warm-mounted LEARN tab hides this view with display:none, which
+  // does NOT stop the graph library's internal render loop (the kapsule
+  // _animationCycle keeps requesting frames behind the hidden canvas).
+  // pauseAnimation / resumeAnimation are kapsule-exposed methods on the
+  // component ref; both react-force-graph-3d and react-force-graph-2d
+  // declare them in their .d.ts, and resuming while already running is a
+  // no-op, so the visible=true pass is safe on every mount. renderMode
+  // and threeReady stay in the deps so the effect re-runs once the
+  // actual graph instance behind fgRef mounts or is swapped.
+  useEffect(() => {
+    const r = fgRef.current as { pauseAnimation?: () => void; resumeAnimation?: () => void } | null;
+    if (!r) return;
+    if (visible) r.resumeAnimation?.();
+    else r.pauseAnimation?.();
+  }, [visible, appearance.renderMode, threeReady]);
+
   // Spaceship flight (3D). A single rAF loop integrates a velocity from the
   // held keys (W/S forward, A/D strafe, Q/E up-down, arrows too) with ease-in
   // acceleration and exponential drag, so holding a key accelerates and
@@ -2034,6 +2618,11 @@ const Graph3DView: React.FC<{
   // button FTLs back to the cluster. Ignored while typing in the search box.
   useEffect(() => {
     if (appearance.renderMode !== '3d') return;
+    // A hidden warm-mounted tab must not keep the flight rAF loop (and
+    // its ~10Hz hit-proxy scan) running behind display:none. Returning
+    // here tears the loop down via the cleanup; the effect re-runs and
+    // restarts it when the tab is shown again.
+    if (!visible) return;
     const FLY = new Set(['w', 'a', 's', 'd', 'q', 'e', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright']);
     const keys = new Set<string>();
     let raf = 0;
@@ -2045,6 +2634,7 @@ const Graph3DView: React.FC<{
     let homeTween: null | { t: number; dur: number; px: number; py: number; pz: number; tx: number; ty: number; tz: number; mx: number; my: number; mz: number; lx: number; ly: number; lz: number } = null;
     let wasFar = false;
     let frame = 0;
+    let hitFrame = 0;
 
     type FgApi = {
       camera?: () => import('three').PerspectiveCamera;
@@ -2114,6 +2704,54 @@ const Graph3DView: React.FC<{
       raf = requestAnimationFrame(loop);
       const dt = last ? Math.min(0.05, (t - last) / 1000) : 0.016;
       last = t;
+      // Hit-proxy autoscale, throttled to ~10Hz and run BEFORE the idle
+      // gate (orbit/trackball dragging moves the camera without setting
+      // any flight state). Each node's invisible hover target grows with
+      // camera distance so far-away nodes stay hoverable, floored at its
+      // base radius and capped at 8 world units (~0.45x the default link
+      // rest length of 18) so proxies never swallow their neighbors.
+      hitFrame += 1;
+      if (hitFrame % 6 === 0) {
+        const hctx = getCtx();
+        if (hctx) {
+          const camPos = hctx.cam.position;
+          type ProxyNode = {
+            x?: number; y?: number; z?: number;
+            __threeObj?: { children?: Array<{ userData?: { hitProxy?: boolean; hitBaseRadius?: number }; scale?: { setScalar: (s: number) => void } }> };
+          };
+          for (const n of dataRef.current.nodes as unknown as ProxyNode[]) {
+            const grp = n.__threeObj;
+            if (!grp?.children || typeof n.x !== 'number') continue;
+            for (const child of grp.children) {
+              if (!child.userData?.hitProxy) continue;
+              const base = child.userData.hitBaseRadius ?? 1;
+              const dist = Math.hypot(n.x - camPos.x, (n.y ?? 0) - camPos.y, (n.z ?? 0) - camPos.z);
+              child.scale?.setScalar(Math.min(8, Math.max(base, dist * 0.02)));
+              break;
+            }
+          }
+          // While a hover lineage is active, the engine's layout tick
+          // rebuilds every curved link's TubeGeometry at base radius on
+          // each position update during the cooldown, erasing the 2.6x
+          // thickening the hover effect installed. Re-apply the boost to
+          // any lineage tube whose geometry identity no longer matches
+          // the one this code installed, rebuilding from the link's
+          // CURRENT curve so the tube tracks the still-moving nodes.
+          // Bounded cost: lineage links only, ~10Hz, and thickenedRef is
+          // empty whenever no hover is active; once the engine stops the
+          // identity check matches and this loop does no work.
+          for (const t of thickenedRef.current) {
+            if (t.mode !== 'tube' || !t.mesh.parent) continue;
+            const curve = t.link?.__curve ?? t.curve;
+            if (!curve || typeof t.baseRadius !== 'number') continue;
+            if ((t.mesh as { geometry?: unknown }).geometry === t.boostedGeo) continue;
+            t.mesh.geometry.dispose?.();
+            const reboosted = new hctx.THREE.TubeGeometry(curve, 30, t.baseRadius * 2.6, 6, false);
+            (t.mesh as { geometry: unknown }).geometry = reboosted;
+            t.boostedGeo = reboosted;
+          }
+        }
+      }
       // Idle-gate: when there's no flight input, residual motion, or warp active
       // (and the cluster centroid is already known), skip the entire per-frame
       // flight/centroid/warp computation. The rAF is already re-queued above, so
@@ -2256,7 +2894,7 @@ const Graph3DView: React.FC<{
       if (vignetteRef.current) vignetteRef.current.style.opacity = '0';
       flyRef.current = { flyHome: () => {}, flyForward: () => {} };
     };
-  }, [appearance.renderMode]);
+  }, [appearance.renderMode, visible]);
 
   // Dispose the streak mesh on unmount (three objects must be freed manually).
   useEffect(() => () => {
@@ -2267,6 +2905,140 @@ const Graph3DView: React.FC<{
     seg.material?.dispose?.();
     streakRef.current = null;
   }, []);
+
+  // Per-node Three.js object builder. Memoized (a stable function
+  // identity per generation) because ANY nodeThreeObject identity change
+  // makes three-forcegraph clear + rebuild every node object — the old
+  // inline function did that on every render, including each hover.
+  // A generation is cut when shape/wireframe change (different geometry)
+  // or when three finishes loading (first real build). The closure also
+  // carries the generation's geometry cache, keyed by (shape, size
+  // bucket): buckets are 0.05 world units wide — visually
+  // indistinguishable — and collapse the per-node allocations. The
+  // library _deallocate()s child geometries when it removes node
+  // objects; a disposed-but-cached geometry is transparently re-uploaded
+  // by three on next use, so the sharing stays safe.
+  const nodeGen = useMemo(() => {
+    const geoCache = new Map<string, import('three').BufferGeometry>();
+    const shape = appearance.nodeShape;
+    const wireframe = appearance.wireframe;
+    const getGeometry = (THREE: typeof import('three'), size: number): import('three').BufferGeometry => {
+      const bucket = Math.round(size * 20) / 20;
+      const key = `${shape}:${bucket}`;
+      const cached = geoCache.get(key);
+      if (cached) return cached;
+      let geometry: import('three').BufferGeometry;
+      switch (shape) {
+        case 'cube':
+          geometry = new THREE.BoxGeometry(bucket, bucket, bucket);
+          break;
+        case 'octahedron':
+          geometry = new THREE.OctahedronGeometry(bucket * 0.85);
+          break;
+        case 'tetrahedron':
+          geometry = new THREE.TetrahedronGeometry(bucket);
+          break;
+        case 'icosahedron':
+          geometry = new THREE.IcosahedronGeometry(bucket * 0.85);
+          break;
+        case 'torus':
+          geometry = new THREE.TorusGeometry(bucket * 0.7, bucket * 0.25, 8, 16);
+          break;
+        case 'sphere':
+        default:
+          geometry = new THREE.SphereGeometry(bucket, 16, 16);
+          break;
+      }
+      geoCache.set(key, geometry);
+      return geometry;
+    };
+    const getHaloGeometry = (THREE: typeof import('three'), size: number): import('three').BufferGeometry => {
+      const bucket = Math.round(size * 20) / 20;
+      const key = `halo:${shape}:${bucket}`;
+      const cached = geoCache.get(key);
+      if (cached) return cached;
+      const halo = getGeometry(THREE, size).clone();
+      halo.scale(1.45, 1.45, 1.45);
+      geoCache.set(key, halo);
+      return halo;
+    };
+    const build = (node: { id?: string; color?: string; val?: number }): unknown => {
+      const THREE = threeRef.current;
+      // The two-state load gate means the graph only mounts post-import,
+      // but the guard keeps the accessor safe if probed early.
+      if (!THREE) return undefined;
+      const size = Math.cbrt(node.val ?? 4);
+      const geometry = getGeometry(THREE, size);
+      const colorHex = node.color ?? '#a78bfa';
+      const baseColor = new THREE.Color(colorHex);
+      // Build a Group so we can stack a wireframe halo + inner solid for
+      // the glossy "neon" look the codepens go for.
+      const group = new THREE.Group();
+      // Tag the group with the node id so the hover-dim effect (which
+      // traverses the scene) can find which child meshes belong to which
+      // graph node. Each material also carries userData.baseOpacity so
+      // the dim/restore math knows the un-dimmed target value. Materials
+      // stay per-node on purpose: the lineage glow tween mutates opacity
+      // per mesh, so shared materials would couple unrelated nodes.
+      group.userData.nodeId = node.id;
+      if (wireframe) {
+        const wireMat = new THREE.MeshBasicMaterial({
+          color: baseColor,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.95,
+        });
+        wireMat.userData.baseOpacity = 0.95;
+        group.add(new THREE.Mesh(geometry, wireMat));
+      } else {
+        // Solid inner core + slightly larger translucent "halo" that
+        // approximates a glow without needing a postprocessing pass.
+        const innerMat = new THREE.MeshBasicMaterial({
+          color: baseColor,
+          transparent: true,
+          opacity: 0.95,
+        });
+        innerMat.userData.baseOpacity = 0.95;
+        group.add(new THREE.Mesh(geometry, innerMat));
+        const haloMat = new THREE.MeshBasicMaterial({
+          color: baseColor,
+          transparent: true,
+          opacity: 0.22,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        });
+        haloMat.userData.baseOpacity = 0.22;
+        group.add(new THREE.Mesh(getHaloGeometry(THREE, size), haloMat));
+      }
+      // Invisible hover hit-proxy: ONE shared unit-sphere geometry + ONE
+      // shared invisible material (module-cached), scaled per node to
+      // 2.5x the node size. Raycasting recurses into node-group children
+      // (getGraphObj walks back up to the group), so this widens the
+      // hover target at zero render cost. The flight loop re-scales it
+      // with camera distance.
+      if (!hitProxyGeo) hitProxyGeo = new THREE.SphereGeometry(1, 8, 6);
+      if (!hitProxyMat) hitProxyMat = new THREE.MeshBasicMaterial({ visible: false });
+      const hit = new THREE.Mesh(hitProxyGeo, hitProxyMat);
+      hit.userData.hitProxy = true;
+      hit.userData.hitBaseRadius = 2.5 * size;
+      hit.scale.setScalar(2.5 * size);
+      group.add(hit);
+      return group;
+    };
+    return { build, geoCache };
+  }, [appearance.nodeShape, appearance.wireframe, threeReady]);
+  const nodeThreeObject = nodeGen.build;
+
+  // Dispose the outgoing generation's cached geometries when a new one
+  // replaces it, and on unmount. Double-dispose (the library also
+  // deallocates on object removal) is harmless — dispose is idempotent.
+  useEffect(() => {
+    const cache = nodeGen.geoCache;
+    return () => {
+      cache.forEach((g) => g.dispose());
+      cache.clear();
+    };
+  }, [nodeGen]);
 
   if (connected.nodes.length === 0) {
     return (
@@ -2285,148 +3057,26 @@ const Graph3DView: React.FC<{
         <div style="color: #a3a3a3; font-size: 10px;">${escapeHtml(n.source)} · ${escapeHtml(n.model)}</div>
       </div>`;
 
-  // Build a Three.js mesh per node based on the chosen shape +
-  // wireframe flag. Lazy-imports three only when the 3D mode is on
-  // so 2D users don't pay the bundle cost.
-  const buildNodeObject = useMemo(() => {
-    let THREE: typeof import('three') | null = null;
-    return async (
-      node: { color?: string; val?: number },
-    ): Promise<unknown> => {
-      if (!THREE) {
-        THREE = await import('three');
-      }
-      const t = THREE;
-      const size = Math.cbrt(node.val ?? 4);
-      let geometry: import('three').BufferGeometry;
-      switch (appearance.nodeShape) {
-        case 'cube':
-          geometry = new t.BoxGeometry(size, size, size);
-          break;
-        case 'octahedron':
-          geometry = new t.OctahedronGeometry(size * 0.85);
-          break;
-        case 'tetrahedron':
-          geometry = new t.TetrahedronGeometry(size);
-          break;
-        case 'icosahedron':
-          geometry = new t.IcosahedronGeometry(size * 0.85);
-          break;
-        case 'torus':
-          geometry = new t.TorusGeometry(size * 0.7, size * 0.25, 8, 16);
-          break;
-        case 'sphere':
-        default:
-          geometry = new t.SphereGeometry(size, 12, 12);
-          break;
-      }
-      const color = new t.Color(node.color ?? '#a78bfa');
-      const material = new t.MeshBasicMaterial({
-        color,
-        wireframe: appearance.wireframe,
-        transparent: true,
-        opacity: appearance.wireframe ? 0.95 : 0.9,
-      });
-      const mesh = new t.Mesh(geometry, material);
-      return mesh;
-    };
-    // Re-build when shape OR wireframe toggle changes.
-  }, [appearance.nodeShape, appearance.wireframe]);
-
-  // Synchronous wrapper: react-force-graph calls nodeThreeObject
-  // synchronously, so we cache the lazy-import promise + render with
-  // a placeholder until three is loaded. In practice three loads in
-  // <100ms once the user opens the 3D tab.
-  const threeRef = useRef<typeof import('three') | null>(null);
-  useEffect(() => {
-    if (appearance.renderMode !== '3d') return;
-    void import('three').then((mod) => {
-      threeRef.current = mod;
-    });
-  }, [appearance.renderMode]);
-
-  const nodeThreeObject = (node: { id?: string; color?: string; val?: number }): unknown => {
-    void buildNodeObject;
-    const THREE = threeRef.current;
-    if (!THREE) return undefined; // first frame: fall through to default sphere
-    const size = Math.cbrt(node.val ?? 4);
-    let geometry: import('three').BufferGeometry;
-    switch (appearance.nodeShape) {
-      case 'cube':
-        geometry = new THREE.BoxGeometry(size, size, size);
-        break;
-      case 'octahedron':
-        geometry = new THREE.OctahedronGeometry(size * 0.85);
-        break;
-      case 'tetrahedron':
-        geometry = new THREE.TetrahedronGeometry(size);
-        break;
-      case 'icosahedron':
-        geometry = new THREE.IcosahedronGeometry(size * 0.85);
-        break;
-      case 'torus':
-        geometry = new THREE.TorusGeometry(size * 0.7, size * 0.25, 8, 16);
-        break;
-      case 'sphere':
-      default:
-        geometry = new THREE.SphereGeometry(size, 16, 16);
-        break;
-    }
-    const colorHex = node.color ?? '#a78bfa';
-    const baseColor = new THREE.Color(colorHex);
-    // Build a Group so we can stack a wireframe halo + inner solid for
-    // the glossy "neon" look the codepens go for.
-    const group = new THREE.Group();
-    // Tag the group with the node id so the hover-dim effect (which
-    // traverses the scene) can find which child meshes belong to which
-    // graph node. Each material also carries userData.baseOpacity so
-    // the dim/restore math knows the un-dimmed target value.
-    group.userData.nodeId = node.id;
-    if (appearance.wireframe) {
-      const wireMat = new THREE.MeshBasicMaterial({
-        color: baseColor,
-        wireframe: true,
-        transparent: true,
-        opacity: 0.95,
-      });
-      wireMat.userData.baseOpacity = 0.95;
-      group.add(new THREE.Mesh(geometry, wireMat));
-    } else {
-      // Solid inner core + slightly larger translucent "halo" that
-      // approximates a glow without needing a postprocessing pass.
-      const innerMat = new THREE.MeshBasicMaterial({
-        color: baseColor,
-        transparent: true,
-        opacity: 0.95,
-      });
-      innerMat.userData.baseOpacity = 0.95;
-      group.add(new THREE.Mesh(geometry, innerMat));
-      const haloGeo = geometry.clone();
-      haloGeo.scale(1.45, 1.45, 1.45);
-      const haloMat = new THREE.MeshBasicMaterial({
-        color: baseColor,
-        transparent: true,
-        opacity: 0.22,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      });
-      haloMat.userData.baseOpacity = 0.22;
-      group.add(new THREE.Mesh(haloGeo, haloMat));
-    }
-    return group;
-  };
+  // Explicit canvas size once the container has been measured; before
+  // that the library would size itself from the window instead.
+  const graphDims = dims.w > 0 && dims.h > 0 ? { width: dims.w, height: dims.h } : {};
 
   return (
-    <div className="absolute inset-0" style={{ background: bgColor }}>
+    <div ref={containerRef} className="absolute inset-0" style={{ background: bgColor }}>
       {appearance.renderMode === '3d' ? (
+        threeReady ? (
         <ForceGraph3D
           ref={fgRef}
+          {...graphDims}
           graphData={data}
           nodeAutoColorBy="source"
           nodeRelSize={7}
           backgroundColor={bgColor}
           showNavInfo={false}
           controlType={appearance.controlType}
+          // Pre-run the force layout off-screen so the graph appears
+          // near-settled instead of exploding into place on mount.
+          warmupTicks={80}
           onNodeHover={handleNodeHover}
           onNodeClick={handleNodeClick}
           onNodeRightClick={handleNodeRightClick}
@@ -2435,16 +3085,14 @@ const Graph3DView: React.FC<{
             const srcId = typeof l.source === 'object' ? l.source?.id : l.source;
             const tgtId = typeof l.target === 'object' ? l.target?.id : l.target;
             const onPath = lineage.has(srcId ?? '') && lineage.has(tgtId ?? '');
-            return onPath ? (l.color ?? '#a78bfa') : '#1c1828';
+            // Glow, don't hide: lineage links brighten, the rest keep their color.
+            return onPath ? '#f3e8ff' : (l.color ?? '#a78bfa');
           }}
           linkOpacity={appearance.linkOpacity}
-          linkWidth={(l: { source?: { id?: string } | string; target?: { id?: string } | string }) => {
-            if (!hoveredId) return appearance.linkWidth;
-            const srcId = typeof l.source === 'object' ? l.source?.id : l.source;
-            const tgtId = typeof l.target === 'object' ? l.target?.id : l.target;
-            const onPath = lineage.has(srcId ?? '') && lineage.has(tgtId ?? '');
-            return onPath ? appearance.linkWidth * 2.2 : appearance.linkWidth * 0.4;
-          }}
+          // MUST stay a stable number: any linkWidth identity change makes
+          // three-forcegraph rebuild every link cylinder. The hover 2.6x
+          // lineage thickening is applied imperatively in the glow effect.
+          linkWidth={appearance.linkWidth}
           linkCurvature={appearance.edgeCurve}
           linkDirectionalArrowLength={5}
           linkDirectionalArrowRelPos={0.92}
@@ -2455,18 +3103,37 @@ const Graph3DView: React.FC<{
           nodeThreeObject={nodeThreeObject}
           nodeLabel={labelHtml}
           onEngineStop={() => {
-            // Re-anchor cluster halos around the new settled positions.
-            // The callback short-circuits if cluster coloring is off, so
-            // this is a no-op cost when the user isn't using the tint.
+            // First stop after a (re)layout = the settle point: claim the
+            // single initial camera fit here (the fallback timer covers a
+            // cold engine). Then re-anchor cluster halos around the new
+            // settled positions — that callback short-circuits if cluster
+            // coloring is off, so it costs nothing without the tint.
+            runInitialFit();
             void rebuildClusterHalos();
           }}
         />
+        ) : (
+          // Two-state load: keep the engine-loading note up until three
+          // finishes importing. Mounting <ForceGraph3D> earlier makes
+          // nodeThreeObject return undefined, so the library renders its
+          // default spheres (~7x larger) first and rebuilds moments later.
+          <div className="absolute inset-0 flex items-center justify-center text-[10px] font-mono text-zinc-500">Loading 3D engine…</div>
+        )
       ) : (
         <ForceGraph2D
           ref={fgRef}
+          {...graphDims}
           graphData={data}
           nodeRelSize={7}
           backgroundColor={bgColor}
+          // Pre-run the force layout off-screen so the graph appears
+          // near-settled instead of exploding into place on mount,
+          // matching the 3D branch above.
+          warmupTicks={80}
+          // First engine stop claims the single initial camera fit
+          // (runInitialFit is once-guarded via fitDoneRef); without it
+          // the 2D branch only fit via the 2s fallback timer.
+          onEngineStop={runInitialFit}
           // Node drag is on by default in ForceGraph2D — being explicit
           // here so a refactor doesn't silently disable it. Each node is
           // grabbable; the force layout updates around it in real time.
@@ -2481,7 +3148,8 @@ const Graph3DView: React.FC<{
             const srcId = typeof l.source === 'object' ? l.source?.id : l.source;
             const tgtId = typeof l.target === 'object' ? l.target?.id : l.target;
             const onPath = lineage.has(srcId ?? '') && lineage.has(tgtId ?? '');
-            return onPath ? (l.color ?? '#a78bfa') : '#1c1828';
+            // Glow, don't hide: lineage links brighten, the rest keep their color.
+            return onPath ? '#f3e8ff' : (l.color ?? '#a78bfa');
           }}
           linkLineDash={() => null}
           linkWidth={(l: { source?: { id?: string } | string; target?: { id?: string } | string }) => {
@@ -2489,7 +3157,8 @@ const Graph3DView: React.FC<{
             const srcId = typeof l.source === 'object' ? l.source?.id : l.source;
             const tgtId = typeof l.target === 'object' ? l.target?.id : l.target;
             const onPath = lineage.has(srcId ?? '') && lineage.has(tgtId ?? '');
-            return onPath ? appearance.linkWidth * 2.2 : appearance.linkWidth * 0.4;
+            // Glow, don't hide: lineage links thicken, the rest stay unchanged.
+            return onPath ? appearance.linkWidth * 2.6 : appearance.linkWidth;
           }}
           linkCurvature={appearance.edgeCurve}
           linkDirectionalArrowLength={6}
@@ -2523,25 +3192,9 @@ const Graph3DView: React.FC<{
           nodeLabel={labelHtml}
         />
       )}
-      {/* Search overlay — sits above the graph canvas, fixed top-left.
-          Typing filters nodes/edges by dimming non-matching ones; empty
-          query restores everything. Inspired by graphrag-workbench's
-          query box. */}
+      {/* Camera controls overlay — the search input moved to the modal
+          header (one box drives Genealogy AND this view). */}
       <div className="absolute top-2 left-2 z-10 flex items-center gap-2">
-        <input
-          id="lineage-graph-search"
-          name="lineage-graph-search"
-          type="search"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Search graph…"
-          className="bg-black/60 backdrop-blur-sm border border-purple-500/30 rounded px-2 py-1 text-[10px] font-mono text-zinc-200 placeholder-zinc-500 w-44 focus:outline-none focus:border-purple-400/60"
-        />
-        {matchSet !== null && (
-          <span className="text-[9px] font-mono text-purple-300/80 px-1.5 py-0.5 bg-purple-500/10 border border-purple-500/20 rounded">
-            {matchSet.size} / {connected.nodes.length}
-          </span>
-        )}
         {appearance.renderMode === '3d' && (
           <>
             <button
@@ -2602,7 +3255,7 @@ const Graph3DView: React.FC<{
         {appearance.renderMode === '3d'
           ? 'click-drag rotate · wheel zoom · WASD/arrows fly — hold to accelerate, release to coast (Q/E up-down, ⇧ afterburner) · F = FTL jump · Home button warps back · click node for details'
           : 'click-drag pan · wheel zoom · click node for details · right-click node for actions'}
-        {' · '}{connected.nodes.length} connected nodes · {connected.edges.length} relationships
+        {' · '}{connected.nodes.length} nodes · {connected.edges.length} relationships
       </div>
 
       {/* Right-click context menu for graph nodes (plan step 3d). */}
@@ -2728,7 +3381,7 @@ const Graph3DView: React.FC<{
       })()}
     </div>
   );
-};
+});
 
 function pickNodeColor(n: GraphNode): string {
   switch (n.source) {

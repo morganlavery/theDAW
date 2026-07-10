@@ -2,16 +2,18 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Play, Square, Download, Trash2, ZoomIn, ZoomOut, Send, Save } from 'lucide-react';
 import { usePianoRollStore, pianoNotesToMidiNotes, type PianoNote } from '../../state/pianoRollStore';
 import { usePlaybackStore } from '../../state/playbackStore';
-import { getEngineCtx, getMasterGain } from '../../state/playerStore';
+import { getEngineCtx } from '../../state/playerStore';
 import { useEditorStore, computePeaks } from '../../state/editorStore';
 import { downloadMidi, parseMidi } from '../../utils/midi';
 import { logError, logInfo } from '../../state/logStore';
 import { MidiMapper } from './MidiMapper';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
-import { triggerActiveVoice, renderStepNotesToBlob } from '../../lib/midiSynth';
-import { isSoundfontActive, previewNoteSF } from '../../lib/soundfontEngine';
+import { renderStepNotesToBlob } from '../../lib/midiSynth';
+import { triggerPianoNote } from '../../lib/pianoTrigger';
 import { InstrumentPicker } from './InstrumentPicker';
 import { MidiImportPopover } from './MidiImportPopover';
+import { parseSheetFile } from '../../lib/sheetImportClient';
+import { AiComposePopover } from './AiComposePopover';
 
 const NOTE_HEIGHT = 12;
 const HEADER_HEIGHT = 22;
@@ -21,40 +23,14 @@ const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 
 const isBlackKey = (midi: number) => [1, 3, 6, 8, 10].includes(midi % 12);
 const noteLabel = (midi: number) => `${NOTE_NAMES[midi % 12]}${Math.floor(midi / 12) - 1}`;
 
-/** Live preview convenience: route the shared synth voice through the engine
- *  master/analyser. The voice itself lives in `lib/midiSynth` so previews,
- *  bounces, and library MIDI renders all sound identical. */
-const triggerPianoNote = (midi: number, velocity: number, when: number, duration: number, master: number) => {
-  const ctx = getEngineCtx();
-  if (ctx.state === 'suspended') void ctx.resume();
-  if (isSoundfontActive()) {
-    // The soundfont voice plays immediately, so approximate the scheduled
-    // `when` with a timer relative to now (fine for preview + playback).
-    const delayMs = Math.max(0, (when - ctx.currentTime) * 1000);
-    window.setTimeout(() => void previewNoteSF(midi, velocity, duration), delayMs);
-    return;
-  }
-  triggerActiveVoice(ctx, getMasterGain(), midi, velocity, when, duration, master);
-};
-
-/**
- * Public alias used by the global Web MIDI listener in App.tsx.
- * Defaults `when` to the engine's current time + a tiny lookahead,
- * `duration` to a comfortable 180ms decay, and `master` to 0.8 so
- * controller-driven notes feel uniform without callers having to
- * know the synth's internals. The PianoRoll component itself still
- * uses the bare `triggerPianoNote` for its own scheduling.
- */
+// triggerPianoNote / triggerPianoNoteFromMidi live in lib/pianoTrigger so the
+// global Web MIDI listener + Sway surface can play a note without importing this
+// whole component graph. The piano roll uses `triggerPianoNote` for its own
+// scheduling (imported above).
 const PIANO_MIDI_PARAMS = [
   { key: 'bpm' as const,        label: 'BPM',         min: 40,  max: 240, autoCc: 14, integer: true },
   { key: 'totalSteps' as const, label: 'Total Steps', min: 16,  max: 256, autoCc: 15, integer: true },
 ];
-
-export const triggerPianoNoteFromMidi = (midi: number, velocity = 100, duration = 0.18) => {
-  const ctx = getEngineCtx();
-  if (ctx.state === 'suspended') void ctx.resume();
-  triggerPianoNote(midi, velocity, ctx.currentTime + 0.02, duration, 0.8);
-};
 
 /** Render the current pattern offline to a WAV Blob. Used by SEND TO EDITOR.
  *  Delegates to the shared step renderer in `lib/midiSynth`. */
@@ -76,6 +52,7 @@ export const PianoRoll: React.FC = () => {
   const selectedNoteId = usePianoRollStore((s) => s.selectedNoteId);
   const isPlaying = usePianoRollStore((s) => s.isPlaying);
   const currentStep = usePianoRollStore((s) => s.currentStep);
+  const recordedRange = usePianoRollStore((s) => s.recordedRange);
 
   const setBpm = usePianoRollStore((s) => s.setBpm);
   const setTotalSteps = usePianoRollStore((s) => s.setTotalSteps);
@@ -192,23 +169,40 @@ export const PianoRoll: React.FC = () => {
     }
     setPlaying(false);
   }, [setPlaying]);
+  // Time-based lookahead scheduler: notes fire at their exact time
+  // (step * stepSec), so FRACTIONAL step positions (32nd/64th notes and
+  // micro-timing offsets) play — not just integer 16ths. Loops seamlessly by
+  // scheduling each note's next occurrence every `total` steps.
   useEffect(() => {
     if (!isPlaying) return;
-    const stepMs = (60_000 / Math.max(40, bpm)) / 4;
-    const start = () => {
-      const next = (stepRef.current + 1) % totalSteps;
-      stepRef.current = next;
-      setCurrentStep(next);
-      const ctx = getEngineCtx();
-      const when = ctx.currentTime + 0.02;
+    const ctx = getEngineCtx();
+    if (ctx.state === 'suspended') void ctx.resume();
+    const stepSec = 60 / Math.max(40, bpm) / 4;
+    const lookahead = 0.12; // seconds scheduled ahead each tick
+    const startTime = ctx.currentTime + 0.06;
+    const startStep = stepRef.current;
+    const total = Math.max(1, totalSteps);
+    let cursor = startStep - 1e-4; // absolute step scheduled up to (exclusive)
+
+    const tick = () => {
+      const now = ctx.currentTime;
+      const targetAbs = startStep + (now + lookahead - startTime) / stepSec;
       for (const n of usePianoRollStore.getState().notes) {
-        if (n.step === next) {
-          const noteDur = (n.length * stepMs) / 1000;
-          triggerPianoNote(n.note, n.velocity, when, noteDur, masterRef.current);
+        let occ = n.step + Math.ceil((cursor - n.step) / total) * total;
+        if (occ <= cursor) occ += total;
+        while (occ <= targetAbs) {
+          const when = startTime + (occ - startStep) * stepSec;
+          triggerPianoNote(n.note, n.velocity, Math.max(now, when), n.length * stepSec, masterRef.current);
+          occ += total;
         }
       }
+      cursor = targetAbs;
+      const elapsedAbs = startStep + (now - startTime) / stepSec;
+      const pos = ((elapsedAbs % total) + total) % total;
+      stepRef.current = pos;
+      setCurrentStep(pos);
     };
-    playTimerRef.current = window.setInterval(start, stepMs);
+    playTimerRef.current = window.setInterval(tick, 25);
     return () => {
       if (playTimerRef.current != null) {
         window.clearInterval(playTimerRef.current);
@@ -222,16 +216,10 @@ export const PianoRoll: React.FC = () => {
       stopPlayback();
       return;
     }
-    // Fire step 0 immediately.
+    // Start from the top; the lookahead scheduler (effect above) fires notes,
+    // including step 0, at their exact times.
     const ctx = getEngineCtx();
     if (ctx.state === 'suspended') void ctx.resume();
-    const when = ctx.currentTime + 0.02;
-    const stepMs = (60_000 / Math.max(40, bpm)) / 4;
-    for (const n of notes) {
-      if (n.step === 0) {
-        triggerPianoNote(n.note, n.velocity, when, (n.length * stepMs) / 1000, masterRef.current);
-      }
-    }
     setCurrentStep(0);
     stepRef.current = 0;
     setPlaying(true);
@@ -360,6 +348,40 @@ export const PianoRoll: React.FC = () => {
     }).catch((e) => logError('piano-roll', `Could not read file: ${e instanceof Error ? e.message : String(e)}`));
   };
 
+  const handleImportSheet = (file: File) => {
+    void (async () => {
+      try {
+        const score = await parseSheetFile(file);
+        // Flatten all parts into a single piano-roll layer (step/length already
+        // on the 16th grid from the backend).
+        const flat: PianoNote[] = [];
+        for (const track of score.tracks) {
+          for (const n of track.notes) {
+            flat.push({
+              id: `sheet-${Math.random().toString(36).slice(2)}-${flat.length}`,
+              note: n.pitch,
+              step: n.step,
+              length: Math.max(1, n.length),
+              velocity: n.velocity,
+            });
+          }
+        }
+        if (flat.length === 0) {
+          logError('piano-roll', `No notes found in "${file.name}"`);
+          return;
+        }
+        flat.sort((a, b) => a.step - b.step);
+        importNotes(flat, score.bpm);
+        logInfo(
+          'piano-roll',
+          `Imported ${flat.length} notes from score "${file.name}" (${score.format}) at ${Math.round(score.bpm)} BPM`,
+        );
+      } catch (e) {
+        logError('piano-roll', `Sheet import failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    })();
+  };
+
   const handleGridScroll = () => {
     if (keyboardRowsRef.current && gridScrollRef.current) {
       keyboardRowsRef.current.scrollTop = gridScrollRef.current.scrollTop;
@@ -406,6 +428,20 @@ export const PianoRoll: React.FC = () => {
     logInfo('piano-roll', `Applied timing feel: quantize ${quantizePct}% · swing/rag ${swingPct}%`);
   };
 
+  // Center the vertical scroll on the note content so it's visible in the tall
+  // full-piano grid (~88 rows). Re-centers when the content pitch range changes
+  // (a capture / import / clip load), not on edits within the current range.
+  const contentLo = notes.length ? notes.reduce((m, n) => Math.min(m, n.note), 127) : 60;
+  const contentHi = notes.length ? notes.reduce((m, n) => Math.max(m, n.note), 0) : 72;
+  useEffect(() => {
+    const el = gridScrollRef.current;
+    if (!el) return;
+    const midNote = (contentLo + contentHi) / 2;
+    const midY = (highestNote - midNote) * NOTE_HEIGHT;
+    el.scrollTop = Math.max(0, midY - el.clientHeight / 2);
+    if (keyboardRowsRef.current) keyboardRowsRef.current.scrollTop = el.scrollTop;
+  }, [contentLo, contentHi, highestNote]);
+
   // Build keyboard rows + grid rows for rendering.
   const rows: number[] = [];
   for (let n = highestNote; n >= lowestNote; n -= 1) rows.push(n);
@@ -429,8 +465,9 @@ export const PianoRoll: React.FC = () => {
         }}
       />
 
-      {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-2 py-1 border-b border-white/5 bg-black/40 shrink-0">
+      {/* Toolbar — extra right padding reserves space for the MIDI mapper pill
+          (absolute top-right) so it never covers CLEAR / the right-side controls. */}
+      <div className="flex items-center justify-between gap-2 pl-2 pr-20 py-1 border-b border-white/5 bg-black/40 shrink-0">
         <div className="flex items-center gap-2">
           <button
             onClick={handlePlayToggle}
@@ -509,7 +546,11 @@ export const PianoRoll: React.FC = () => {
         </div>
         <div className="flex items-center gap-2">
           <span className="text-[9px] font-mono text-zinc-500">{notes.length} note{notes.length === 1 ? '' : 's'}</span>
-          <MidiImportPopover onImportFile={handleImportMidi} />
+          <AiComposePopover
+            currentBpm={bpm}
+            onGenerated={(result) => importNotes(result.notes, result.bpm)}
+          />
+          <MidiImportPopover onImportFile={handleImportMidi} onImportSheetFile={handleImportSheet} />
           <button
             onClick={handleExportMidi}
             className="btn-ghost text-[9px] py-1 flex items-center gap-1.5"
@@ -613,6 +654,17 @@ export const PianoRoll: React.FC = () => {
                 style={{ left: i * stepPx }}
               />
             ))}
+            {/* Recorded-region highlight: marks the last live take without
+                shrinking the grid (the rest of the 256 stays empty). */}
+            {recordedRange && recordedRange.endStep > recordedRange.startStep && (
+              <div
+                className="absolute top-0 bottom-0 bg-emerald-400/8 border-x border-emerald-400/40 pointer-events-none"
+                style={{
+                  left: recordedRange.startStep * stepPx,
+                  width: (recordedRange.endStep - recordedRange.startStep) * stepPx,
+                }}
+              />
+            )}
             {/* Playhead */}
             {isPlaying && (
               <div
@@ -657,7 +709,7 @@ export const PianoRoll: React.FC = () => {
       {/* Status */}
       <div className="h-5 border-t border-white/5 bg-black/60 flex items-center justify-between px-3 shrink-0">
         <span className="text-[8px] font-mono text-zinc-500">
-          {isPlaying ? `PLAYING · step ${currentStep + 1}/${totalSteps}` : 'STOPPED'} · {bpm} BPM
+          {isPlaying ? `PLAYING · step ${Math.floor(currentStep) + 1}/${totalSteps}` : 'STOPPED'} · {bpm} BPM
           {editingClipId && (
             <span className="ml-2 px-1 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/40 text-emerald-300 text-[7px] uppercase tracking-widest">
               Linked to clip {editingClipId.slice(0, 8)}

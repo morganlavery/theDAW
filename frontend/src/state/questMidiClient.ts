@@ -6,7 +6,7 @@
  * separate Node bridge. Inbound Quest MIDI is republished on the global
  * `midiBus`, so every existing consumer (piano synth, VJ forwarder, MidiMapper,
  * the questControlStore) sees it exactly like a hardware controller. Return MIDI
- * (e.g. an audio-reactive feed for the GANTASMO Visor) goes back via
+ * (e.g. an audio-reactive feed for the headset MIDI Reactor) goes back via
  * `sendQuestMidi`.
  *
  * Same-origin URL so it rides the Vite dev proxy (ws:true) in development and is
@@ -22,8 +22,13 @@ let running = false;
 let everConnected = false;
 
 function wsUrl(): string {
-  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/api/questmidi/ws`;
+  const { protocol, host } = window.location;
+  if (protocol === 'https:') {
+    return `wss://${host}/api/questmidi/ws`;
+  }
+  // Desktop (app://) and local dev: connect straight to the backend — the
+  // app:// handler can't upgrade WebSockets and dev proxies may lack ws:true.
+  return 'ws://localhost:8600/api/questmidi/ws';
 }
 
 function scheduleReconnect(): void {

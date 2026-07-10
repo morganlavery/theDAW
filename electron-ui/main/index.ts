@@ -5,6 +5,8 @@ import {
   dialog,
   protocol,
   net,
+  session,
+  shell,
 } from 'electron'
 import { ChildProcess, spawn, execFile } from 'child_process'
 import * as fs from 'fs'
@@ -33,17 +35,38 @@ const repoRoot = getRepoRoot()
 // Logging
 // ---------------------------------------------------------------------------
 
-const logsDir = path.join(repoRoot, 'logs')
-fs.mkdirSync(logsDir, { recursive: true })
+// Guarded: on a read-only mount (AppImage squashfs, running a mac app straight
+// off the dmg) an unguarded mkdirSync here killed the main process before any
+// window existed. Fall back to Electron's per-user logs dir, then to a no-op
+// stream so logging can never take the app down.
+function openLogStream(): fs.WriteStream | null {
+  for (const dir of [path.join(repoRoot, 'logs'), app.getPath('logs')]) {
+    try {
+      fs.mkdirSync(dir, { recursive: true })
+      const stream = fs.createWriteStream(path.join(dir, 'backend.log'), {
+        flags: 'a',
+      })
+      // Disk-full or revoked-handle write errors surface as an 'error' event;
+      // without a listener that event crashes the process.
+      stream.on('error', () => {})
+      return stream
+    } catch {
+      // try the next location
+    }
+  }
+  return null
+}
 
-const logStream = fs.createWriteStream(path.join(logsDir, 'backend.log'), {
-  flags: 'a',
-})
+const logStream = openLogStream()
 
 function log(msg: string): void {
   const ts = new Date().toISOString()
   const line = `[${ts}] ${msg}\n`
-  logStream.write(line)
+  try {
+    logStream?.write(line)
+  } catch {
+    // never let logging take the app down
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -53,10 +76,153 @@ function log(msg: string): void {
 let backendProcess: ChildProcess | null = null
 let weSpawnedBackend = false
 let isQuitting = false
+// First-run `uv sync` child; tracked so before-quit can kill it (an orphaned
+// sync keeps downloading and holds the venv lock against the next launch).
+let uvSyncProcess: ChildProcess | null = null
 
 const BACKEND_BASE = 'http://localhost:8600'
 const HEALTH_URL = `${BACKEND_BASE}/api/health`
 const SHUTDOWN_URL = `${BACKEND_BASE}/api/admin/shutdown`
+
+// ---------------------------------------------------------------------------
+// Packaged-app paths + first-run bootstrap
+//
+// In a packaged build the Python project, a bundled uv.exe, and ffmpeg.exe ship
+// under process.resourcesPath (see electron-builder.yml -> extraResources). The
+// per-user install directory is writable, so uv creates the venv next to the
+// bundled pyproject.toml on first launch and the backend writes its data/ tree
+// there. In dev none of this applies: the backend runs from the repo via uv on
+// PATH exactly as before.
+// ---------------------------------------------------------------------------
+
+function getPythonDir(): string {
+  return app.isPackaged ? path.join(process.resourcesPath, 'python') : repoRoot
+}
+
+function getToolsDir(): string {
+  return path.join(process.resourcesPath, 'tools')
+}
+
+function getUvCommand(): string {
+  if (!app.isPackaged) return 'uv'
+  // Packaged builds bundle the uv binary under resources/tools: 'uv.exe' on
+  // Windows, 'uv' on macOS (see scripts/fetch-runtime-tools.mjs).
+  return path.join(
+    getToolsDir(),
+    process.platform === 'win32' ? 'uv.exe' : 'uv',
+  )
+}
+
+function venvPython(pyDir: string): string {
+  return process.platform === 'win32'
+    ? path.join(pyDir, '.venv', 'Scripts', 'python.exe')
+    : path.join(pyDir, '.venv', 'bin', 'python')
+}
+
+// Environment for the backend + the uv sync step. Packaged builds prepend the
+// bundled tools dir (uv.exe, ffmpeg.exe, ffprobe.exe) to PATH so the backend's
+// audio I/O resolves ffmpeg without a system install. The PATH key is matched
+// case-insensitively because Windows exposes it as "Path".
+function buildBackendEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, SA3_SUPERVISOR_PRESENT: '1' }
+  if (app.isPackaged) {
+    const toolsDir = getToolsDir()
+    const key = Object.keys(env).find((k) => k.toLowerCase() === 'path') ?? 'PATH'
+    env[key] = `${toolsDir}${path.delimiter}${env[key] ?? ''}`
+  }
+  // Keep uv's package cache on the SAME volume as the venv (getPythonDir()) so
+  // wheels hardlink into .venv on first-run sync instead of falling back to
+  // slow full copies. uv cannot hardlink across volumes, and its default cache
+  // lives on the system drive — which may differ from the drive the app is
+  // installed on (or the repo lives on in dev). Same-volume cache = fast setup,
+  // no "failed to hardlink" fallback, less disk. This also reaches any uv the
+  // backend itself invokes (e.g. the on-demand Underfit trainer env). An
+  // explicit UV_CACHE_DIR (e.g. from theDAW.bat's dev/web launch) is respected.
+  const cacheKey = Object.keys(env).find((k) => k.toLowerCase() === 'uv_cache_dir')
+  if (!cacheKey) env.UV_CACHE_DIR = path.join(getPythonDir(), '.uv-cache')
+  return env
+}
+
+function coreImportsOk(py: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    try {
+      const proc = spawn(py, ['-c', 'import uvicorn, fastapi'], {
+        stdio: 'ignore',
+        windowsHide: true,
+      })
+      proc.on('exit', (code) => resolve(code === 0))
+      proc.on('error', () => resolve(false))
+    } catch {
+      resolve(false)
+    }
+  })
+}
+
+function runUvSync(uvCmd: string, cwd: string): Promise<void> {
+  return new Promise((resolve) => {
+    log(`Running ${uvCmd} sync --group dev in ${cwd}`)
+    const proc = spawn(uvCmd, ['sync', '--group', 'dev'], {
+      cwd,
+      env: buildBackendEnv(),
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    })
+    // Track the child so quitting mid-setup kills it instead of orphaning a
+    // multi-GB download that holds the venv lock against the next launch.
+    uvSyncProcess = proc
+    const emit = (data: Buffer): void => {
+      for (const raw of data.toString().split('\n')) {
+        const text = raw.replace(/\r$/, '').trimEnd()
+        if (!text.trim()) continue
+        log(`[uv] ${text}`)
+        sendLoadingLog(text, '')
+      }
+    }
+    proc.stdout?.on('data', emit)
+    proc.stderr?.on('data', emit)
+    proc.on('exit', (code) => {
+      uvSyncProcess = null
+      if (code === 0) {
+        sendLoadingLog('Dependencies installed.', 'load')
+      } else {
+        sendLoadingStatus('Setup failed — see the error below')
+        sendLoadingLog(
+          `Setup step exited with code ${code}. The app may not start until this is resolved.`,
+          'err',
+        )
+      }
+      resolve()
+    })
+    proc.on('error', (err) => {
+      uvSyncProcess = null
+      sendLoadingStatus('Setup failed — see the error below')
+      sendLoadingLog(`Setup failed to start: ${err.message}`, 'err')
+      resolve()
+    })
+  })
+}
+
+// First-run bootstrap: build the venv when it is missing or a core import fails
+// (a uv sync interrupted after the venv is created but before packages install
+// leaves a half-built env). Streams progress into the boot cinematic. No-op in
+// dev, where the repo venv is managed by theDAW.bat / uv on PATH.
+async function ensurePythonEnv(): Promise<void> {
+  if (!app.isPackaged) return
+  const pyDir = getPythonDir()
+  const py = venvPython(pyDir)
+  let ok = fs.existsSync(py)
+  if (ok) ok = await coreImportsOk(py)
+  if (ok) {
+    log('Python env present and complete — skipping sync.')
+    return
+  }
+  sendLoadingStatus('First run: setting up the audio engine')
+  sendLoadingLog(
+    'Installing the Python runtime and dependencies. The first run downloads several GB and can take several minutes.',
+    'load',
+  )
+  await runUvSync(getUvCommand(), pyDir)
+}
 
 async function isBackendRunning(): Promise<boolean> {
   try {
@@ -73,10 +239,43 @@ function spawnBackend(): void {
   log('Spawning backend process...')
 
   const isWindows = process.platform === 'win32'
-  const cwd = repoRoot
-  const env = { ...process.env, SA3_SUPERVISOR_PRESENT: '1' }
+  const cwd = getPythonDir()
+  const env = buildBackendEnv()
+  const devVenvPy = venvPython(cwd)
+  const useDevVenv = !app.isPackaged && fs.existsSync(devVenvPy)
 
-  if (isWindows) {
+  if (app.isPackaged) {
+    // The bundled uv is an absolute path, so it is invoked directly (no shell).
+    backendProcess = spawn(
+      getUvCommand(),
+      ['run', 'python', '-m', 'backend._supervisor'],
+      {
+        cwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        detached: !isWindows,
+      },
+    )
+  } else if (useDevVenv) {
+    // Dev: launch with the project venv's Python directly. `uv run` can fail when
+    // uv's cache is unavailable, which silently leaves no backend on :8600 — the
+    // frontend then shows 500s for every /api call (Vite's proxy returns 500 on
+    // ECONNREFUSED). theDAW.bat already provisions the venv, so this is the
+    // reliable dev path; the uv branches below remain the fallback.
+    log(`Spawning backend via venv Python: ${devVenvPy}`)
+    backendProcess = spawn(
+      devVenvPy,
+      ['-m', 'backend._supervisor'],
+      {
+        cwd,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: isWindows,
+        detached: !isWindows,
+      },
+    )
+  } else if (isWindows) {
     backendProcess = spawn(
       'cmd',
       ['/c', 'uv run python -m backend._supervisor'],
@@ -152,29 +351,6 @@ function spawnBackend(): void {
     sendLoadingLog(`Backend process error: ${err.message}`, 'err')
     backendProcess = null
   })
-}
-
-async function waitForBackend(maxAttempts = 30): Promise<boolean> {
-  let delay = 1000
-  const MAX_DELAY = 8000
-
-  for (let i = 0; i < maxAttempts; i++) {
-    if (await isBackendRunning()) {
-      log('Backend is healthy.')
-      sendLoadingLog('Backend is healthy.', 'ok')
-      sendLoadingStatus('Loading app...')
-      return true
-    }
-    const msg = `Health check ${i + 1}/${maxAttempts} — waiting...`
-    log(`Health check attempt ${i + 1}/${maxAttempts} failed, retrying in ${delay}ms...`)
-    sendLoadingLog(msg, '')
-    await new Promise((resolve) => setTimeout(resolve, delay))
-    delay = Math.min(delay * 2, MAX_DELAY)
-  }
-
-  log('Backend failed to become healthy within timeout.')
-  sendLoadingLog('Backend failed to become healthy within timeout.', 'err')
-  return false
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +429,37 @@ function killBackend(): Promise<void> {
 
 let mainWindow: BrowserWindow | null = null
 
+// ---------------------------------------------------------------------------
+// OS file-open (.tasmo / .gan associations)
+//
+// Double-clicking an associated file launches (or re-uses) theDAW with the path
+// in argv (Windows/Linux) or via the 'open-file' event (macOS). We forward the
+// path to the renderer, which routes .tasmo -> project load and .gan -> the MIX
+// plugin loader. If the window isn't ready yet, the path is held and flushed on
+// did-finish-load.
+// ---------------------------------------------------------------------------
+
+let pendingOpenFile: string | null = null
+
+function fileArgFrom(argv: string[]): string | null {
+  for (const a of argv) {
+    if (typeof a !== 'string') continue
+    const lower = a.toLowerCase()
+    if ((lower.endsWith('.tasmo') || lower.endsWith('.gan')) && fs.existsSync(a)) {
+      return a
+    }
+  }
+  return null
+}
+
+function deliverOpenFile(filePath: string): void {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('open-file', filePath)
+  } else {
+    pendingOpenFile = filePath
+  }
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -260,87 +467,76 @@ function createWindow(): void {
     minWidth: 960,
     minHeight: 640,
     title: 'theDAW',
+    // Open windowed at the default size (reverted from forced fullscreen).
+    fullscreen: false,
+    // Paint solid black immediately so there's no white window flash before
+    // content loads — one continuous black background from the first frame to
+    // the app (matches index.html's <body> + the boot splash).
+    backgroundColor: '#000000',
     webPreferences: {
       preload: path.join(__dirname, '../preload/index.js'),
       sandbox: true,
+      // The boot cinematic's logo is a muted, looping video — allow it to
+      // autoplay without a user gesture (Chromium blocks this by default).
+      autoplayPolicy: 'no-user-gesture-required',
     },
   })
 
-  // Show a loading page while backend boots
-  mainWindow.loadURL(
-    `data:text/html;charset=utf-8,${encodeURIComponent(loadingHTML())}`,
-  )
+  // Route outbound http(s) links (update/release pages, the Hugging Face
+  // sign-in) to the user's default browser, where they may already be signed
+  // in. Same-origin http(s) — the dev server's own navigations — stays in-app,
+  // and so does the local backend origin (the packaged renderer opens the VJ
+  // pop-out at BACKEND_BASE/vj-app, which must be an in-app child window so
+  // the renderer keeps a window handle for postMessage control).
+  const isExternal = (url: string): boolean => {
+    if (!/^https?:\/\//i.test(url)) return false
+    try {
+      const target = new URL(url)
+      if (target.origin === new URL(BACKEND_BASE).origin) return false
+      const here = mainWindow?.webContents.getURL() || 'app://./'
+      return target.origin !== new URL(here).origin
+    } catch {
+      return false
+    }
+  }
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (isExternal(url)) {
+      void shell.openExternal(url)
+      return { action: 'deny' }
+    }
+    return { action: 'allow' }
+  })
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (isExternal(url)) {
+      event.preventDefault()
+      void shell.openExternal(url)
+    }
+  })
+
+  // Load the React renderer IMMEDIATELY (no separate spinner page). The renderer
+  // shows the boot cinematic and polls /api/health on its own, holding until the
+  // backend is ready — exactly like the web app. This keeps ONE background the
+  // whole time and keeps the desktop + web boot flows in sync.
+  loadRenderer()
 }
 
-function loadingHTML(): string {
-  return `<!DOCTYPE html>
-<html>
-<head>
-  <style>
-    body {
-      margin: 0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 100vh;
-      background: #0a0a0f;
-      color: #e0e0e0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      flex-direction: column;
-      gap: 16px;
+function loadRenderer(): void {
+  if (!mainWindow) return
+  // Flush any file the app was opened with once the renderer has loaded.
+  mainWindow.webContents.on('did-finish-load', () => {
+    if (pendingOpenFile && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('open-file', pendingOpenFile)
+      pendingOpenFile = null
     }
-    .spinner {
-      width: 40px;
-      height: 40px;
-      border: 3px solid #333;
-      border-top-color: #8b5cf6;
-      border-radius: 50%;
-      animation: spin 0.8s linear infinite;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    h2 { font-size: 18px; margin: 0; }
-    #status { font-size: 13px; opacity: 0.6; margin: 0; }
-    #log {
-      position: fixed;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      height: 180px;
-      background: #06060a;
-      border-top: 1px solid #1a1a2e;
-      font-family: "Cascadia Code", "Fira Code", "Consolas", monospace;
-      font-size: 11px;
-      color: #7a7a9a;
-      padding: 8px 12px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-    }
-    #log .err { color: #ef4444; }
-    #log .load { color: #8b5cf6; }
-    #log .ok { color: #22c55e; }
-  </style>
-</head>
-<body>
-  <div class="spinner"></div>
-  <h2>theDAW</h2>
-  <p id="status">Starting backend...</p>
-  <div id="log"></div>
-  <script>
-    function addLog(text, cls) {
-      const el = document.getElementById('log');
-      const line = document.createElement('div');
-      if (cls) line.className = cls;
-      line.textContent = text;
-      el.appendChild(line);
-      el.scrollTop = el.scrollHeight;
-    }
-    function setStatus(text) {
-      document.getElementById('status').textContent = text;
-    }
-  </script>
-</body>
-</html>`
+  })
+  const devURL = process.env.ELECTRON_RENDERER_URL
+  if (!app.isPackaged && devURL) {
+    mainWindow.loadURL(devURL)
+  } else if (!app.isPackaged) {
+    mainWindow.loadURL('http://localhost:5173')
+  } else {
+    mainWindow.loadURL('app://./index.html')
+  }
 }
 
 function escapeForJS(s: string): string {
@@ -375,13 +571,32 @@ function registerAppProtocol(): void {
   protocol.handle('app', (request) => {
     const url = new URL(request.url)
 
-    // Intercept /api/* requests and proxy to backend
+    // Intercept /api/* requests and proxy to backend. duplex:'half' is
+    // REQUIRED whenever body is a stream — without it the fetch-spec Request
+    // constructor throws and every body-carrying POST/PUT in the packaged app
+    // fails with net::ERR_FAILED. The catch turns backend-down into a clean
+    // 502 instead of an opaque network error.
     if (url.pathname.startsWith('/api/')) {
-      return net.fetch(`${BACKEND_BASE}${url.pathname}${url.search}`, {
-        method: request.method,
-        headers: request.headers,
-        body: request.body,
-      })
+      return net
+        .fetch(`${BACKEND_BASE}${url.pathname}${url.search}`, {
+          method: request.method,
+          headers: request.headers,
+          body: request.body,
+          duplex: 'half',
+        } as RequestInit)
+        .catch(() => new Response('backend unavailable', { status: 502 }))
+    }
+
+    // Proxy the backend-served static VJ build too, so any relative /vj-app/
+    // URL works under the app:// origin (the renderer bundle contains no
+    // vj-app; the build ships beside the backend and is mounted by server.py).
+    if (url.pathname === '/vj-app' || url.pathname.startsWith('/vj-app/')) {
+      return net
+        .fetch(`${BACKEND_BASE}${url.pathname}${url.search}`, {
+          method: request.method,
+          headers: request.headers,
+        })
+        .catch(() => new Response('backend unavailable', { status: 502 }))
     }
 
     // Serve static files from the built renderer output
@@ -432,11 +647,55 @@ function registerIpcHandlers(): void {
       return result
     },
   )
+
+  // Quit the app on request (Settings "Shutdown" in desktop mode). app.quit()
+  // triggers before-quit, which kills the spawned backend, then closes the window.
+  ipcMain.handle('app:quit', () => {
+    app.quit()
+  })
+
+  // Native window handle (HWND on Windows) for embedding a VST3 editor window
+  // into the MIX area: the backend sidecar reparents the editor under this HWND.
+  // getNativeWindowHandle() returns a Buffer holding the pointer; encode it as a
+  // decimal string so it survives JSON/IPC without precision loss.
+  ipcMain.handle('window:getNativeHandle', () => {
+    if (!mainWindow) return null
+    try {
+      const buf = mainWindow.getNativeWindowHandle()
+      const value = buf.length >= 8 ? buf.readBigUInt64LE(0) : BigInt(buf.readUInt32LE(0))
+      return value.toString()
+    } catch {
+      return null
+    }
+  })
+
+  // Screen-space rect of the web content area (DIP), so the renderer can convert
+  // an element's client rect into absolute screen pixels for positioning the
+  // embedded VST window. Changes as the window moves/resizes.
+  ipcMain.handle('window:getContentBounds', () => {
+    if (!mainWindow) return null
+    try {
+      return mainWindow.getContentBounds()
+    } catch {
+      return null
+    }
+  })
 }
 
 // ---------------------------------------------------------------------------
 // App lifecycle
 // ---------------------------------------------------------------------------
+
+// Windows camera backend: Chromium defaults to the Media Foundation video-capture
+// backend, which does NOT enumerate many virtual / phone-as-webcam bridges
+// (Iriun, Camo, DroidCam, EpocCam, NDI, OBS virtual camera) that register only as
+// DirectShow devices — so they never appear in enumerateDevices() and can't be
+// picked in the camera selector. Forcing the DirectShow capturer surfaces them.
+// Physical cameras keep working under DirectShow on Windows 10/11; remove this
+// switch only if a specific Media-Foundation-only device regresses.
+if (process.platform === 'win32') {
+  app.commandLine.appendSwitch('disable-features', 'MediaFoundationVideoCapture')
+}
 
 // Register custom protocol scheme before app is ready
 protocol.registerSchemesAsPrivileged([
@@ -451,7 +710,47 @@ protocol.registerSchemesAsPrivileged([
   },
 ])
 
-app.whenReady().then(async () => {
+// Single-instance: a second launch (e.g. double-clicking a .tasmo while running)
+// forwards its file arg to the existing window instead of starting a second app.
+const gotSingleInstanceLock = app.requestSingleInstanceLock()
+if (!gotSingleInstanceLock) {
+  app.quit()
+}
+app.on('second-instance', (_event, argv) => {
+  const f = fileArgFrom(argv)
+  if (f) deliverOpenFile(f)
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.focus()
+  }
+})
+// macOS delivers associated files via this event rather than argv.
+app.on('open-file', (event, filePath) => {
+  event.preventDefault()
+  deliverOpenFile(filePath)
+})
+
+if (gotSingleInstanceLock) app.whenReady().then(async () => {
+  // The path the app was launched with (Windows/Linux argv), flushed to the
+  // renderer once it loads.
+  const launchFile = fileArgFrom(process.argv)
+  if (launchFile) pendingOpenFile = launchFile
+
+
+  // Identify as theDAW, not "Electron": names the process / menu / userData dir
+  // and, via the AppUserModelID, the Windows taskbar grouping + shortcut binding.
+  app.setName('theDAW')
+  app.setAppUserModelId('com.gantasmo.thedaw')
+
+  // Grant media (microphone / camera) capture to the renderer. Electron layers
+  // its own permission gate on top of the OS; with no handler a getUserMedia
+  // track can return MUTED — the OS opens the device but the renderer receives
+  // silence. The renderer only ever loads our own local content, so granting is
+  // safe. Mic capture (vocal record) and camera (VJ) both depend on this.
+  const ses = session.defaultSession
+  ses.setPermissionRequestHandler((_wc, _permission, callback) => callback(true))
+  ses.setPermissionCheckHandler(() => true)
+
   registerIpcHandlers()
 
   // In production, register our custom protocol
@@ -459,48 +758,22 @@ app.whenReady().then(async () => {
     registerAppProtocol()
   }
 
+  // Window loads the renderer (boot cinematic) right away.
   createWindow()
 
-  // Check if backend is already running
-  sendLoadingLog('Checking for running backend...', '')
+  // Spawn the backend in the background if it isn't already up. The renderer's
+  // own health polling + cinematic cover the wait; if the backend never comes
+  // up, the app surfaces its "continue without backend" escape — same as web.
   const alreadyRunning = await isBackendRunning()
-
   if (!alreadyRunning) {
-    sendLoadingLog('No backend found — spawning...', '')
-    sendLoadingStatus('Starting backend...')
-    spawnBackend()
+    // Packaged builds bootstrap the Python env on first launch before the
+    // backend can start; dev builds no-op here.
+    await ensurePythonEnv()
+    // The await above can resume AFTER the user began quitting mid-setup;
+    // spawning then would launch a backend nothing ever kills.
+    if (!isQuitting) spawnBackend()
   } else {
     log('Backend already running — skipping spawn.')
-    sendLoadingLog('Backend already running — skipping spawn.', 'ok')
-  }
-
-  // Wait for backend to be healthy
-  const healthy = await waitForBackend()
-
-  if (!mainWindow) return
-
-  if (healthy) {
-    // Load the renderer
-    const devURL = process.env.ELECTRON_RENDERER_URL
-    if (!app.isPackaged && devURL) {
-      mainWindow.loadURL(devURL)
-    } else if (!app.isPackaged) {
-      mainWindow.loadURL('http://localhost:5173')
-    } else {
-      mainWindow.loadURL('app://./index.html')
-    }
-  } else {
-    mainWindow.loadURL(
-      `data:text/html;charset=utf-8,${encodeURIComponent(
-        `<!DOCTYPE html>
-<html><body style="background:#0a0a0f;color:#e0e0e0;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-  <div style="text-align:center;">
-    <h1 style="color:#ef4444;">Backend Failed to Start</h1>
-    <p>Check logs at: ${logsDir.replace(/\\/g, '/')}/backend.log</p>
-  </div>
-</body></html>`,
-      )}`,
-    )
   }
 })
 
@@ -511,8 +784,17 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', (event) => {
   if (isQuitting) return
+  isQuitting = true
+  // Kill an in-flight first-run sync so it doesn't outlive the app holding
+  // the venv lock (on Windows the child survives parent death otherwise).
+  if (uvSyncProcess && uvSyncProcess.exitCode === null) {
+    try {
+      uvSyncProcess.kill()
+    } catch {
+      // already gone
+    }
+  }
   if (weSpawnedBackend && backendProcess) {
-    isQuitting = true
     event.preventDefault()
     killBackend().finally(() => {
       app.quit()

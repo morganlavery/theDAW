@@ -8,6 +8,7 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 import base64
+import importlib
 import io
 import json
 import logging
@@ -20,9 +21,10 @@ import tempfile
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import numpy as np
 from fastapi import Body, FastAPI, Form, File, HTTPException, Request, UploadFile
@@ -45,7 +47,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="theDAW API")
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """FastAPI lifespan (replaces the deprecated on_event hooks). The startup
+    and shutdown bodies live in `_on_startup` / `_on_shutdown` below; globals
+    resolve at call time, so their later definition is fine."""
+    await _on_startup()
+    yield
+    await _on_shutdown()
+
+
+app = FastAPI(title="theDAW API", lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,6 +72,16 @@ pipeline: Any = None
 sample_rate = 44100
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 MODULES_DIR = Path(__file__).parent / "modules"
+
+# Install the LOG-panel ring handler BEFORE modules load, so module-load
+# lines (and failures) are captured; the lifespan re-attaches it in case
+# uvicorn's logging setup replaced root handlers in between.
+try:
+    from backend.log_ring import install_log_ring as _install_log_ring
+
+    _install_log_ring()
+except Exception:  # noqa: BLE001 — logging must never block boot
+    pass
 
 app.state.loaded_modules = load_modules(app, MODULES_DIR)
 DEFAULT_GENERATION_MODEL = "medium"
@@ -121,7 +144,9 @@ def _warm_heavy() -> None:
 
         import torch
         import torch.version  # submodule; explicit so type checkers resolve .cuda
-        import torchaudio  # noqa: F401
+
+        # Warm-only import (side effect: module cached in sys.modules).
+        importlib.import_module("torchaudio")
 
         gpu_info = "no CUDA"
         if torch.cuda.is_available():
@@ -139,7 +164,8 @@ def _warm_heavy() -> None:
         )
 
         _generation_models()
-        from stable_audio_3.inference import distribution_shift  # noqa: F401
+        # Warm-only import (side effect: module cached in sys.modules).
+        importlib.import_module("stable_audio_3.inference.distribution_shift")
 
         logger.info("startup: heavy imports warmed (torch + stable_audio_3 ready)")
     except Exception as e:  # noqa: BLE001 — warming is best-effort
@@ -268,7 +294,10 @@ def _ensure_gpu_clear_of_magenta() -> None:
             logger.info("model.swap: stopping resident MRT2 engine before SA3 load")
             magenta_sidecar.stop_engine()
     except Exception:
-        logger.debug("model.swap: magenta engine pre-clear failed", exc_info=True)
+        # WARNING, not debug: if this guard fails, the SA3 load proceeds into
+        # exactly the GPU-commit-exhaustion crash it exists to prevent, and
+        # the user needs to see why.
+        logger.warning("model.swap: magenta engine pre-clear failed", exc_info=True)
 
 
 def _get_or_load_generation_pipeline(model_name: str):
@@ -796,9 +825,18 @@ def _generate_spectrograms(waveform: torch.Tensor, sr: int) -> dict[str, str]:
     return result
 
 
-@app.on_event("startup")
-async def load_model():
+async def _on_startup():
     startup_t0 = time.perf_counter()
+
+    # Attach the in-memory log ring so the LOG panel (VERBOSE mode) can stream
+    # real backend activity. Runs after uvicorn's logging setup and re-attaches
+    # if that dropped the handler. Cheap and torch-free.
+    try:
+        from backend.log_ring import install_log_ring
+
+        install_log_ring()
+    except Exception:
+        logger.debug("log ring install failed", exc_info=True)
 
     # System stats (kept torch-free so server-ready never waits on the ~9.6s
     # torch/stable_audio_3 import; the GPU/torch line is logged by _warm_heavy
@@ -843,15 +881,41 @@ async def load_model():
     except Exception as e:
         logger.warning("startup: background worker queue failed to start: %s", e)
 
+    # One idle-gated pass to ensure every entry with MIDI has a titled sheet
+    # (and existing sheets get their "Music21 Fragment" placeholder replaced
+    # with the real song name). Idempotent + serialized, so it's safe to run
+    # every launch — it only does work where a sheet is missing or mistitled.
+    try:
+        from backend.core.background_workers import get_background_queue
+        from backend.modules.library.router import get_store as _get_lib_store
+        from backend.modules.notation.backfill import backfill_scores
 
-@app.on_event("shutdown")
-async def stop_background_workers() -> None:
+        _bf_store = _get_lib_store()
+
+        async def _run_backfill() -> None:
+            import asyncio
+
+            await asyncio.to_thread(backfill_scores, _bf_store)
+
+        get_background_queue().enqueue("notation:backfill", _run_backfill)
+    except Exception as e:
+        logger.debug("startup: notation backfill enqueue skipped: %s", e)
+
+
+async def _on_shutdown() -> None:
     try:
         from backend.core.background_workers import get_background_queue
 
         await get_background_queue().stop()
     except Exception:
         # Shutdown is best-effort; never block process exit.
+        pass
+    try:
+        from backend.core.teardown import stop_all_sidecars
+
+        # Off the loop: sidecar stops block on process waits.
+        await asyncio.to_thread(stop_all_sidecars)
+    except Exception:
         pass
 
 
@@ -880,8 +944,15 @@ async def get_all_modules():
 
 @app.patch("/api/modules/{module_name}/enabled")
 async def set_module_enabled(module_name: str, enabled: bool = Body(..., embed=True)):
-    modules_dir = Path(__file__).parent / "modules"
-    config_path = modules_dir / module_name / "module.json"
+    modules_dir = (Path(__file__).parent / "modules").resolve()
+    config_path = (modules_dir / module_name / "module.json").resolve()
+    # Contain the write to a direct child module directory: reject path traversal
+    # (e.g. "../../x") or nested/absolute names so this can only touch a module.json.
+    if (
+        not config_path.is_relative_to(modules_dir)
+        or config_path.parent.parent != modules_dir
+    ):
+        raise HTTPException(status_code=400, detail="Invalid module name")
     if not config_path.exists():
         raise HTTPException(status_code=404, detail="Module not found")
     config = json.loads(config_path.read_text())
@@ -892,7 +963,10 @@ async def set_module_enabled(module_name: str, enabled: bool = Body(..., embed=T
 
 
 @app.get("/api/system-stats")
-async def system_stats():
+def system_stats():
+    # Plain def: runs in the threadpool. The first call may pay the heavy
+    # torch import and every call runs nvidia-smi; neither may block the
+    # event loop (health checks and audio streaming share it).
     import torch
 
     stats: dict = {}
@@ -911,6 +985,7 @@ async def system_stats():
                 capture_output=True,
                 text=True,
                 timeout=2,
+                stdin=subprocess.DEVNULL,
             )
             if r.returncode == 0:
                 parts = [p.strip() for p in r.stdout.strip().split(",")]
@@ -947,9 +1022,10 @@ async def health():
 
 
 @app.get("/api/model-info")
-async def model_info():
+def model_info():
     # Lazy loading: the server runs model-free until first use, so this
     # endpoint reports metadata instead of erroring when nothing is loaded.
+    # Plain def (threadpool): the first call may pay the heavy torch import.
     import torch
 
     return {
@@ -1130,8 +1206,6 @@ async def preload_model(model: str = Form(...)):
 @app.post("/api/spectrogram")
 async def generate_spectrogram(
     audio_base64: Optional[str] = Form(None),
-    mime_type: str = Form("audio/wav"),
-    sample_rate_form: int = Form(44100),
     audio_file: Optional[UploadFile] = File(None),
 ):
     """
@@ -1275,6 +1349,11 @@ async def generate(
     init_audio: Optional[UploadFile] = File(None),
     inpaint_audio: Optional[UploadFile] = File(None),
 ):
+    # RF-Inversion fields are part of the documented request surface (the
+    # frontend sends them; USER_GUIDE lists them) but the local pipeline has
+    # no inversion path yet, so they are accepted and intentionally unused.
+    _ = (inversion_steps, inversion_gamma, inversion_unconditional)
+
     import torch
     import torchaudio
     from stable_audio_3.inference.distribution_shift import (
@@ -1283,109 +1362,118 @@ async def generate(
         LogSNRShift,
     )
 
-    # lazy: load (or wake) the active model on first use; clear any resident
-    # MRT2 engine first so SA3 never stacks on top of it (commit-limit crash)
-    await asyncio.get_event_loop().run_in_executor(None, _ensure_gpu_clear_of_magenta)
-    # Off the event loop (see /api/generate-jobs): a synchronous model load here
-    # would block the single worker and stall /health + media streaming.
-    generation_pipeline = await asyncio.get_event_loop().run_in_executor(
-        None, _get_or_load_generation_pipeline, _active_model_name
-    )
+    # Hold the generation lock so /api/model/offload|onload cannot move
+    # the weights out from under an in-flight synchronous generation.
+    async with _generation_job_lock:
+        # lazy: load (or wake) the active model on first use; clear any resident
+        # MRT2 engine first so SA3 never stacks on top of it (commit-limit crash)
+        await asyncio.get_event_loop().run_in_executor(
+            None, _ensure_gpu_clear_of_magenta
+        )
+        # Off the event loop (see /api/generate-jobs): a synchronous model load here
+        # would block the single worker and stall /health + media streaming.
+        generation_pipeline = await asyncio.get_event_loop().run_in_executor(
+            None, _get_or_load_generation_pipeline, _active_model_name
+        )
 
-    # Build dist_shift object
-    dist_shift = None
-    if dist_shift_type and dist_shift_type not in ("None", "none", ""):
-        if dist_shift_type == "LogSNR":
-            dist_shift = LogSNRShift(
-                anchor_length=logsnr_anchor_length,
-                anchor_logsnr=logsnr_anchor_logsnr,
-                rate=logsnr_rate,
-                logsnr_end=logsnr_end,
+        # Build dist_shift object
+        dist_shift = None
+        if dist_shift_type and dist_shift_type not in ("None", "none", ""):
+            if dist_shift_type == "LogSNR":
+                dist_shift = LogSNRShift(
+                    anchor_length=logsnr_anchor_length,
+                    anchor_logsnr=logsnr_anchor_logsnr,
+                    rate=logsnr_rate,
+                    logsnr_end=logsnr_end,
+                )
+            elif dist_shift_type == "Flux":
+                dist_shift = FluxDistributionShift(
+                    min_length=flux_min_len,
+                    max_length=flux_max_len,
+                    alpha_min=flux_alpha_min,
+                    alpha_max=flux_alpha_max,
+                )
+            elif dist_shift_type == "Full":
+                dist_shift = DistributionShift(
+                    base_shift=full_base_shift,
+                    max_shift=full_max_shift,
+                    min_length=full_min_len,
+                    max_length=full_max_len,
+                )
+
+        # Load init audio if provided
+        init_audio_tuple = None
+        if init_audio is not None and init_audio.filename:
+            init_audio_tuple = await _load_audio_upload(init_audio)
+        init_audio_type = _validate_init_audio_mode(
+            init_audio_type,
+            has_init_audio=init_audio_tuple is not None,
+        )
+
+        # Load inpaint audio if provided
+        inpaint_audio_tuple = None
+        if inpaint_audio is not None and inpaint_audio.filename:
+            inpaint_audio_tuple = await _load_audio_upload(inpaint_audio)
+
+        generate_args = {
+            "prompt": prompt,
+            "negative_prompt": negative_prompt if negative_prompt else None,
+            "duration": duration,
+            "steps": steps,
+            "cfg_scale": cfg_scale,
+            "seed": seed,
+            "apg_scale": apg_scale,
+            "duration_padding_sec": duration_padding_sec,
+            "scale_phi": cfg_rescale,
+            "cfg_norm_threshold": cfg_norm_threshold,
+            "cfg_interval": (cfg_interval_min, cfg_interval_max),
+        }
+        generate_args["sample_size"] = _compute_request_sample_size(
+            generation_pipeline,
+            duration,
+            duration_padding_sec,
+        )
+
+        if sampler_type:
+            generate_args["sampler_type"] = sampler_type
+        if sigma_max != 1.0:
+            generate_args["sigma_max"] = sigma_max
+        if dist_shift is not None:
+            generate_args["dist_shift"] = dist_shift
+
+        # Init audio (audio-to-audio)
+        if init_audio_tuple:
+            generate_args["init_audio"] = init_audio_tuple
+            generate_args["init_noise_level"] = init_noise_level
+
+        # Inpainting
+        if inpaint_audio_tuple:
+            generate_args["inpaint_audio"] = inpaint_audio_tuple
+            if mask_start > 0 or mask_end > 0:
+                generate_args["inpaint_mask_start_seconds"] = mask_start
+                generate_args["inpaint_mask_end_seconds"] = mask_end
+
+        loop = asyncio.get_event_loop()
+
+        def _do_generate():
+            gen_audio = generation_pipeline.generate(**generate_args)
+            gen_audio = gen_audio.to(torch.float32).clamp(-1, 1).squeeze(0).cpu()
+
+            fmt = file_format if file_format in ("wav", "flac", "ogg") else "wav"
+
+            buf = io.BytesIO()
+            save_kwargs: dict = {}
+            if fmt == "wav":
+                save_kwargs.update(encoding="PCM_S", bits_per_sample=16)
+            # torchaudio.save accepts file-like objects at runtime; its stub
+            # only declares str | PathLike, hence the cast.
+            torchaudio.save(
+                cast(Any, buf), gen_audio, sample_rate, format=fmt, **save_kwargs
             )
-        elif dist_shift_type == "Flux":
-            dist_shift = FluxDistributionShift(
-                min_length=flux_min_len,
-                max_length=flux_max_len,
-                alpha_min=flux_alpha_min,
-                alpha_max=flux_alpha_max,
-            )
-        elif dist_shift_type == "Full":
-            dist_shift = DistributionShift(
-                base_shift=full_base_shift,
-                max_shift=full_max_shift,
-                min_length=full_min_len,
-                max_length=full_max_len,
-            )
+            buf.seek(0)
+            return buf, fmt
 
-    # Load init audio if provided
-    init_audio_tuple = None
-    if init_audio is not None and init_audio.filename:
-        init_audio_tuple = await _load_audio_upload(init_audio)
-    init_audio_type = _validate_init_audio_mode(
-        init_audio_type,
-        has_init_audio=init_audio_tuple is not None,
-    )
-
-    # Load inpaint audio if provided
-    inpaint_audio_tuple = None
-    if inpaint_audio is not None and inpaint_audio.filename:
-        inpaint_audio_tuple = await _load_audio_upload(inpaint_audio)
-
-    generate_args = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt if negative_prompt else None,
-        "duration": duration,
-        "steps": steps,
-        "cfg_scale": cfg_scale,
-        "seed": seed,
-        "apg_scale": apg_scale,
-        "duration_padding_sec": duration_padding_sec,
-        "scale_phi": cfg_rescale,
-        "cfg_norm_threshold": cfg_norm_threshold,
-        "cfg_interval": (cfg_interval_min, cfg_interval_max),
-    }
-    generate_args["sample_size"] = _compute_request_sample_size(
-        generation_pipeline,
-        duration,
-        duration_padding_sec,
-    )
-
-    if sampler_type:
-        generate_args["sampler_type"] = sampler_type
-    if sigma_max != 1.0:
-        generate_args["sigma_max"] = sigma_max
-    if dist_shift is not None:
-        generate_args["dist_shift"] = dist_shift
-
-    # Init audio (audio-to-audio)
-    if init_audio_tuple:
-        generate_args["init_audio"] = init_audio_tuple
-        generate_args["init_noise_level"] = init_noise_level
-
-    # Inpainting
-    if inpaint_audio_tuple:
-        generate_args["inpaint_audio"] = inpaint_audio_tuple
-        if mask_start > 0 or mask_end > 0:
-            generate_args["inpaint_mask_start_seconds"] = mask_start
-            generate_args["inpaint_mask_end_seconds"] = mask_end
-
-    loop = asyncio.get_event_loop()
-
-    def _do_generate():
-        gen_audio = generation_pipeline.generate(**generate_args)
-        gen_audio = gen_audio.to(torch.float32).clamp(-1, 1).squeeze(0).cpu()
-
-        fmt = file_format if file_format in ("wav", "flac", "ogg") else "wav"
-
-        buf = io.BytesIO()
-        save_kwargs: dict = {}
-        if fmt == "wav":
-            save_kwargs.update(encoding="PCM_S", bits_per_sample=16)
-        torchaudio.save(buf, gen_audio, sample_rate, format=fmt, **save_kwargs)
-        buf.seek(0)
-        return buf, fmt
-
-    buffer, fmt = await loop.run_in_executor(None, _do_generate)
+        buffer, fmt = await loop.run_in_executor(None, _do_generate)
 
     mime_map = {"wav": "audio/wav", "flac": "audio/flac", "ogg": "audio/ogg"}
 
@@ -1403,6 +1491,20 @@ async def generate(
 # --- Async job shim for theDAW frontend (generate-jobs + polling) ---
 
 JOBS: dict[str, dict] = {}
+# A completed generate job's "result" carries base64 audio + spectrograms (MBs
+# per job). Without a cap the dict grows for the whole session; prune the oldest
+# FINISHED jobs (never running/queued) once past the limit.
+_JOBS_MAX = 40
+
+
+def _prune_jobs() -> None:
+    while len(JOBS) > _JOBS_MAX:
+        for jid, j in list(JOBS.items()):
+            if j.get("status") in ("completed", "failed", "error"):
+                JOBS.pop(jid, None)
+                break
+        else:
+            break
 
 
 def _generate_to_bytes(
@@ -1426,7 +1528,11 @@ def _generate_to_bytes(
     save_kwargs: dict = {}
     if fmt == "wav":
         save_kwargs.update(encoding="PCM_S", bits_per_sample=16)
-    torchaudio.save(buf, audio, output_sample_rate, format=fmt, **save_kwargs)
+    # torchaudio.save accepts file-like objects at runtime; its stub only
+    # declares str | PathLike, hence the cast.
+    torchaudio.save(
+        cast(Any, buf), audio, output_sample_rate, format=fmt, **save_kwargs
+    )
     return buf.getvalue(), fmt
 
 
@@ -1442,12 +1548,15 @@ async def _run_generate_job(
     lora_weights: list[float],
     lora_temp_dir: Path | None,
 ):
-    import torchaudio
-
     JOBS[job_id]["status"] = "running"
     loop = asyncio.get_event_loop()
     mime_map = {"wav": "audio/wav", "flac": "audio/flac", "ogg": "audio/ogg"}
     try:
+        # Inside the try: if this import fails the job must reach the except/
+        # finally below (status=failed + idle-gate release), not die unobserved
+        # leaving the job "queued" and the background queue jammed forever.
+        import torchaudio
+
         items = []
         async with _generation_job_lock:
             try:
@@ -1525,6 +1634,7 @@ async def _run_generate_job(
                         from backend.modules.library.store import (
                             _maybe_enqueue_analysis,
                             _maybe_enqueue_midi,
+                            _maybe_enqueue_score,
                             _maybe_enqueue_stems,
                         )
 
@@ -1551,6 +1661,9 @@ async def _run_generate_job(
                                 _lib_store, _entry_id, source="generate"
                             )
                             _maybe_enqueue_midi(
+                                _lib_store, _entry_id, source="generate"
+                            )
+                            _maybe_enqueue_score(
                                 _lib_store, _entry_id, source="generate"
                             )
                     except Exception as _e:
@@ -1594,6 +1707,9 @@ async def _run_generate_job(
     except Exception as e:
         JOBS[job_id]["status"] = "failed"
         JOBS[job_id]["error"] = str(e)
+        # Full traceback to the backend log + LOG panel; the job payload only
+        # carries the one-line message.
+        logger.exception("generate job %s failed", job_id)
     finally:
         if lora_temp_dir is not None:
             shutil.rmtree(lora_temp_dir, ignore_errors=True)
@@ -1652,6 +1768,11 @@ async def generate_jobs(
     init_audio: Optional[UploadFile] = File(None),
     inpaint_audio: Optional[UploadFile] = File(None),
 ):
+    # RF-Inversion fields are part of the documented request surface (the
+    # frontend sends them; USER_GUIDE lists them) but the local pipeline has
+    # no inversion path yet, so they are accepted and intentionally unused.
+    _ = (inversion_steps, inversion_gamma, inversion_unconditional)
+
     from stable_audio_3.inference.distribution_shift import (
         DistributionShift,
         FluxDistributionShift,
@@ -1766,6 +1887,7 @@ async def generate_jobs(
         "progress": {"step": 0, "steps": int(steps)},
         "created_at": time.time(),
     }
+    _prune_jobs()
 
     asyncio.create_task(
         _run_generate_job(
@@ -1846,8 +1968,85 @@ async def list_presets():
 
 @app.post("/api/presets")
 async def save_preset(preset: dict):
+    # Stub: preset persistence is not implemented; the body is accepted (and
+    # discarded) so callers stay forward-compatible.
+    _ = preset
     return {"id": str(uuid.uuid4()), "saved": True}
+
+
+@app.get("/api/log")
+async def get_log(since: int = 0, limit: int = 1000):
+    """Recent backend log records for the LOG panel (VERBOSE mode). Purely
+    in-memory (backend/log_ring.py); the frontend polls with a seq cursor."""
+    from backend.log_ring import read_since
+
+    return read_since(since, limit)
 
 
 app.include_router(assistant_router)
 app.include_router(admin_router)
+
+# VJ app served as a static production build (default when a build is
+# bundled/resolvable; theDAW_VJ_DEV=1 opts back into the Node dev server). This
+# removes the runtime Node.js requirement on end-user machines and makes the VJ
+# tab work identically on Windows, macOS, Linux, and Docker. Mounted at
+# /vj-app (matching the VJ build's vite base) BEFORE the SPA catch-all below so
+# it isn't shadowed. In dev the frontend's Vite config proxies /vj-app -> :8600,
+# so the iframe loads it same-origin; in packaged/Docker it's already one origin.
+try:
+    from backend.modules.vj import sidecar as _vj_sidecar
+
+    if _vj_sidecar.is_static_mode():
+        _vj_dist = _vj_sidecar.resolve_dist_dir()
+        if _vj_dist is not None:
+            from fastapi.staticfiles import StaticFiles
+
+            app.mount(
+                _vj_sidecar.STATIC_MOUNT_PATH,
+                StaticFiles(directory=_vj_dist, html=True),
+                name="vj-app",
+            )
+            # Freeze the decision: routes return the /vj-app URL only when
+            # this mount really exists (see sidecar.static_mount_active).
+            _vj_sidecar.STATIC_MOUNTED = True
+            logger.info(
+                "vj: serving %s at %s (static build)",
+                _vj_dist,
+                _vj_sidecar.STATIC_MOUNT_PATH,
+            )
+except Exception as _vj_mount_err:  # noqa: BLE001 — never block boot on VJ
+    logger.warning("vj: static mount skipped: %s", _vj_mount_err)
+
+# Single-container / companion UI serving. Every API route lives under /api and
+# is registered above, BEFORE this mount, so the SPA catch-all can never shadow
+# an endpoint.
+#
+# This fires when a built frontend/dist exists (Docker sets theDAW_SERVE_UI=1;
+# packaged desktop bundles ship a dist), so the desktop UI AND the phone
+# companion entry (frontend/mobile.html -> /mobile.html, with /assets at root)
+# are both reachable over http on the LAN. In pure dev (no dist) it is a no-op:
+# Vite serves the UI on :5173, proxies /api to :8600, and the phone loads
+# http://<lan-ip>:5173/mobile.html directly.
+_ui_dist = PROJECT_ROOT / "frontend" / "dist"
+_serve_ui = (
+    os.environ.get("theDAW_SERVE_UI") == "1" or (_ui_dist / "index.html").is_file()
+)
+if _serve_ui:
+    if (_ui_dist / "index.html").is_file():
+        from fastapi.responses import RedirectResponse
+        from fastapi.staticfiles import StaticFiles
+
+        # Short, phone-typeable alias for the companion entry. Registered BEFORE
+        # the "/" mount below so the mount cannot shadow it. Redirects (rather
+        # than serving mobile.html here) so the browser loads /mobile.html and
+        # its root-relative /assets/* resolve.
+        @app.get("/m", include_in_schema=False)
+        async def _mobile_entry() -> "RedirectResponse":
+            return RedirectResponse(url="/mobile.html")
+
+        app.mount("/", StaticFiles(directory=_ui_dist, html=True), name="ui")
+        logger.info("ui: serving %s at / (companion entry at /m)", _ui_dist)
+    elif os.environ.get("theDAW_SERVE_UI") == "1":
+        logger.warning(
+            "ui: theDAW_SERVE_UI=1 but %s is missing; UI mount skipped", _ui_dist
+        )

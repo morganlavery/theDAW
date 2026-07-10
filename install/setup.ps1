@@ -13,11 +13,13 @@
     2   a required tool (uv / Node) is still missing (declined or failed)
     10  installed something - re-run theDAW.bat so PATH refreshes
 
-  Switch:
-    -Yes   assume "yes" to the prompts (non-interactive)
+  Switches:
+    -Yes            assume "yes" to the prompts (non-interactive)
+    -UnderfitVenv   only run the Underfit trainer-tab venv bootstrap, then exit
+                    (theDAW.bat calls this after the main venv is built)
 #>
 [CmdletBinding()]
-param([switch]$Yes)
+param([switch]$Yes, [switch]$UnderfitVenv)
 $ErrorActionPreference = 'Stop'
 
 # --------------------------------------------------------------------------- #
@@ -40,7 +42,7 @@ function Have($name){ return [bool](Get-Command $name -ErrorAction SilentlyConti
 
 # Re-read PATH from the registry so freshly installed tools are visible to
 # checks later in THIS process (the parent cmd still needs a re-run).
-function Refresh-Path(){
+function Update-Path(){
   $m = [Environment]::GetEnvironmentVariable('Path','Machine')
   $u = [Environment]::GetEnvironmentVariable('Path','User')
   $parts = @()
@@ -49,12 +51,50 @@ function Refresh-Path(){
   $env:Path = ($parts -join ';')
 }
 
+# The Underfit LoRA-trainer tab runs its own uv-managed Python env
+# (underfit/.venv). It's a large, opt-in feature, so this is consent-gated and
+# never blocks theDAW — declining just leaves the tab's dashboard unavailable
+# until you set it up. Creating the env is `uv sync --inexact` (the exact step
+# from underfit/install.sh); the trainer backend + model packs are a separate,
+# heavier step the tab installs on demand.
+function Initialize-UnderfitVenv(){
+  Update-Path
+  $root  = Split-Path -Parent $PSScriptRoot
+  $ufDir = Join-Path $root 'underfit'
+  if(-not (Test-Path (Join-Path $ufDir 'pyproject.toml'))){ return }   # not vendored
+  if(Test-Path (Join-Path $ufDir '.venv\Scripts\python.exe')){ OK 'Underfit trainer env present'; return }
+  Head 'Underfit trainer tab (optional)'
+  if(-not (Have 'uv')){ WARN 'uv is required to create the Underfit env - install uv first, then re-launch.'; return }
+  Info "The Underfit LoRA-trainer tab needs a one-time Python env (underfit\.venv)."
+  Info "This runs 'uv sync' in underfit\ (~a few minutes). Model packs download later, on demand."
+  if(-not (Ask 'Create the Underfit trainer env now?')){ WARN 'Skipped - the Underfit tab stays unavailable until you set it up.'; return }
+  Info 'Creating underfit\.venv via: uv sync --inexact'
+  # Keep uv's cache on the repo's drive so wheels hardlink into underfit\.venv
+  # instead of falling back to slow full copies across volumes (uv can't
+  # hardlink across drives; its default cache is on the system drive). Honors an
+  # inherited UV_CACHE_DIR (e.g. from theDAW.bat) and only sets a default here.
+  if(-not $env:UV_CACHE_DIR){ $env:UV_CACHE_DIR = Join-Path $root '.uv-cache' }
+  Push-Location $ufDir
+  try {
+    & uv sync --inexact
+    if($LASTEXITCODE -eq 0){ OK 'Underfit trainer env created.' }
+    else { WARN "uv sync exited $LASTEXITCODE - the Underfit tab stays unavailable for now." }
+  } finally { Pop-Location }
+}
+
 $wingetOk = Have 'winget'
 
 function Install-Uv(){
   Info "Installing uv (Astral standalone installer, user scope)..."
   try {
     & powershell -NoProfile -ExecutionPolicy ByPass -Command "irm https://astral.sh/uv/install.ps1 | iex"
+    # A failed child powershell (download blocked, TLS error) does NOT throw
+    # here — it just exits non-zero. Without this check the function reported
+    # success, theDAW.bat told the user to re-run, and the loop never ended.
+    if ($LASTEXITCODE -ne 0) {
+      BAD ("uv install failed (exit code " + $LASTEXITCODE + ")")
+      return $false
+    }
     return $true
   } catch {
     BAD ("uv install failed: " + $_.Exception.Message)
@@ -75,7 +115,7 @@ function Install-Winget($id, $label){
   return $false
 }
 
-function Bootstrap-Winget(){
+function Install-AppInstaller(){
   # Best-effort install of the Windows App Installer (which provides winget)
   # when it is absent, so Node / FFmpeg / Git can be fetched. Downloads the
   # VCLibs dependency and the App Installer bundle, then registers them.
@@ -89,13 +129,17 @@ function Bootstrap-Winget(){
     $bundle = Join-Path $tmp 'AppInstaller.msixbundle'
     Invoke-WebRequest 'https://aka.ms/getwinget' -OutFile $bundle -UseBasicParsing
     Add-AppxPackage -Path $bundle
-    Refresh-Path
+    Update-Path
     return [bool](Get-Command winget -ErrorAction SilentlyContinue)
   } catch {
     WARN ('Could not install winget automatically: ' + $_.Exception.Message)
     return $false
   }
 }
+
+# Dedicated mode: theDAW.bat calls `setup.ps1 -UnderfitVenv` after the main venv
+# bootstrap to create the optional Underfit trainer env if it's missing.
+if($UnderfitVenv){ Initialize-UnderfitVenv; exit 0 }
 
 Clear-Host
 Write-Host ""
@@ -161,6 +205,7 @@ else { WARN "winget not found - uv still installs via its own installer; Node/FF
 if($todo.Count -eq 0){
   Head "Everything theDAW needs is already installed"
   OK "No downloads needed."
+  Initialize-UnderfitVenv
   exit 0
 }
 
@@ -191,7 +236,7 @@ $installedAny = $false
 # Node / FFmpeg / Git come through winget. If winget is missing, install it first.
 $needsWinget = ($todo | Where-Object { $_.Name -ne 'uv' } | Measure-Object).Count -gt 0
 if($needsWinget -and -not $wingetOk){
-  if(Bootstrap-Winget){ $wingetOk = $true; OK 'winget installed.' }
+  if(Install-AppInstaller){ $wingetOk = $true; OK 'winget installed.' }
   else { WARN 'winget could not be installed; Node/FFmpeg/Git will need a manual download.' }
 }
 
@@ -202,7 +247,7 @@ foreach($t in $todo){
   else { WARN "$($t.Label) was not installed." }
 }
 
-Refresh-Path
+Update-Path
 
 # =========================================================================== #
 #  DONE

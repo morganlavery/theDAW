@@ -1,13 +1,19 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Scissors, Play, Pause, Square, ZoomIn, ZoomOut,
   Magnet, Trash2, Move, Plus, Volume2, Upload, Save, Piano, Paintbrush, X, Wand2, Layers,
-  SlidersHorizontal, Undo2, Redo2, Gauge, Repeat, Flag,
+  SlidersHorizontal, Undo2, Redo2, Gauge, Repeat, Flag, Circle, Copy, Music,
+  Plug, Snowflake, Loader2, ChevronUp, ChevronDown, RefreshCw, Blocks,
 } from 'lucide-react';
+import { deriveStyle, deriveLyrics } from '../../catalog/catalogSearch';
 import { addBlobsToChimera } from '../../lib/chimeraClient';
 import { SlideTrack } from './SlideTrack';
+import { SemanticWave } from './SemanticWave';
 import { FxRack } from './FxRack';
 import { MetamorphPanel } from './MetamorphPanel';
+import { MagentaToolStage } from './MagentaToolStage';
+import { MAGENTA_TOOLS, magentaToolById, type MagentaTool } from '../../lib/magentaToolCatalog';
 import { AutomationLane } from './AutomationLane';
 import { RACK_EFFECTS, getRackEffect, buildEffectChain, ensureChopModule, teleportXYZ, SPATIAL_TELEPORT, type ChainHandle } from '../../lib/rackEffects';
 import { sliceChunks } from '../../lib/audioAnalysis';
@@ -16,6 +22,14 @@ import type { AudioDragItem } from '../../lib/audioDnD';
 import { useExternalDragStore } from '../../state/externalDragStore';
 import { useEditorStore, computePeaks, sampleLane, type AudioClip, type EditorTrack, type SnapDivision, type AutomationTarget, type AutomationLane as AutomationLaneT, type TimelineMarker } from '../../state/editorStore';
 import { useLibraryStore } from '../../state/libraryStore';
+import { useVstStore } from '../../state/vstStore';
+import { useVstEditorStore } from '../../state/vstEditorStore';
+import { VstEmbedHost } from './VstEmbedHost';
+import { GanPluginStage } from './GanPluginStage';
+import { useGanStore } from '../../state/ganStore';
+import { registerAresBridge, ARES_XY_PAD_FALLBACK_ID } from '../../lib/aresBridge';
+import type { ChainEntry } from '../../state/effectChainStore';
+import type { Vst3PluginInfo } from '../../lib/vstClient';
 import { usePlaybackStore } from '../../state/playbackStore';
 import { getEngineCtx, getMasterGain, usePlayerStore } from '../../state/playerStore';
 import { usePianoRollStore } from '../../state/pianoRollStore';
@@ -29,7 +43,9 @@ import { useBottomPanelStore } from '../../state/bottomPanelStore';
 import { useGenerateParamsStore } from '../../state/generateParamsStore';
 import { logError, logInfo } from '../../state/logStore';
 import { registerEditorPlayback, unregisterEditorPlayback } from '../../state/editorPlaybackBridge';
+import { publishSelectedTracks } from '../../state/editorSelectionBridge';
 import * as liveMixer from '../../state/liveMixer';
+import { useDjAnalysisStore } from '../../state/djAnalysisStore';
 import { ContextMenu, useContextMenu, type ContextMenuItem } from '../ui/ContextMenu';
 
 const TRACK_HEADER_PX = 180;
@@ -125,6 +141,27 @@ const cropAudioBlob = async (
  * Y stacks pitches lowest-to-highest across the body. Velocity sets brightness.
  * Read-only — editing happens in the Piano Roll (double-click / context menu).
  */
+/**
+ * ClipWave — the DJ-style semantic waveform for a timeline audio clip. Renders
+ * only the clip's trim window of its source audio (viewport mapped from
+ * offsetIntoSource/sourceDuration). Owns one object URL per clip, revoked on
+ * unmount. No per-clip playhead — the timeline draws a global one over clips.
+ */
+const ClipWave: React.FC<{ clip: AudioClip; height: number; selected: boolean }> = ({ clip, height, selected }) => {
+  const url = useMemo(() => URL.createObjectURL(clip.audioBlob), [clip.audioBlob]);
+  useEffect(() => () => { try { URL.revokeObjectURL(url); } catch { /* ignore */ } }, [url]);
+  const dur = clip.sourceDuration > 0 ? clip.sourceDuration : clip.durationSec || 1;
+  const viewportStart = clampFrac((clip.offsetIntoSource ?? 0) / dur);
+  const viewportEnd = clampFrac(((clip.offsetIntoSource ?? 0) + clip.durationSec) / dur);
+  return (
+    <div className="h-full w-full" style={{ opacity: selected ? 1 : 0.85 }}>
+      <SemanticWave audioUrl={url} height={height} viewportStart={viewportStart} viewportEnd={Math.max(viewportStart + 1e-4, viewportEnd)} transparentBg />
+    </div>
+  );
+};
+
+const clampFrac = (n: number) => (Number.isFinite(n) ? (n < 0 ? 0 : n > 1 ? 1 : n) : 0);
+
 const MidiClipNotes: React.FC<{ clip: AudioClip; zoom: number; selected: boolean }> = ({ clip, zoom, selected }) => {
   const notes = clip.sourcePianoRoll;
   if (!notes || notes.length === 0) return null;
@@ -179,6 +216,56 @@ const MidiClipNotes: React.FC<{ clip: AudioClip; zoom: number; selected: boolean
 };
 
 /**
+ * Floating popover portaled to document.body, mirroring ContextMenu's pattern:
+ * the Shell scales the DAW with CSS `zoom` (`.dense-layout`), so a fixed panel
+ * rendered INSIDE the zoomed tree drifts away from raw clientX/Y anchors. The
+ * body portal escapes the zoom, so the coords land at the click. After mount
+ * we measure the panel and nudge it to stay inside the viewport (right/bottom
+ * edge clicks would overflow otherwise). When no coords are given the panel
+ * renders at `anchorClassName` (the legacy fixed position) instead.
+ */
+const PopoverPortal: React.FC<{
+  x?: number;
+  y?: number;
+  anchorClassName?: string;
+  className: string;
+  /** Optional external ref (outside-click dismissal needs the panel node). */
+  innerRef?: React.RefObject<HTMLDivElement | null>;
+  children: React.ReactNode;
+}> = ({ x, y, anchorClassName = '', className, innerRef, children }) => {
+  const localRef = useRef<HTMLDivElement | null>(null);
+  const ref = innerRef ?? localRef;
+  const hasCoords = x != null && y != null;
+  const [adjusted, setAdjusted] = useState<{ x: number; y: number } | null>(null);
+  useLayoutEffect(() => {
+    if (x == null || y == null || !ref.current) {
+      setAdjusted(null);
+      return;
+    }
+    const rect = ref.current.getBoundingClientRect();
+    const pad = 8;
+    let nx = x;
+    let ny = y;
+    if (nx + rect.width + pad > window.innerWidth) nx = Math.max(pad, window.innerWidth - rect.width - pad);
+    if (ny + rect.height + pad > window.innerHeight) ny = Math.max(pad, window.innerHeight - rect.height - pad);
+    setAdjusted((prev) => (prev && prev.x === nx && prev.y === ny ? prev : { x: nx, y: ny }));
+  }, [x, y, ref]);
+  // While measuring (first paint) the panel renders off-screen, exactly like
+  // ContextMenu, so the un-clamped position never flashes.
+  const shown = hasCoords ? adjusted ?? { x: -9999, y: -9999 } : null;
+  return createPortal(
+    <div
+      ref={ref}
+      className={`${className}${shown ? '' : ` ${anchorClassName}`}`}
+      style={shown ? { left: shown.x, top: shown.y } : undefined}
+    >
+      {children}
+    </div>,
+    document.body,
+  );
+};
+
+/**
  * Compact per-track instrument selector (channel-rack style). "Default" leaves
  * the track on the global Piano Roll instrument; picking a GM program assigns it
  * to the track, which makes its MIDI clips play that voice live on the timeline.
@@ -210,7 +297,7 @@ const TrackInstrumentSelect: React.FC<{ track: EditorTrack }> = ({ track }) => {
         aria-label={`Track ${track.name} instrument`}
         value={value}
         onChange={onChange}
-        className="flex-1 min-w-0 bg-zinc-900 border border-white/20 rounded px-1 py-0.5 text-[9px] text-zinc-100 outline-none focus:border-purple-500/60"
+        className="flex-1 min-w-0 form-select px-1 py-0.5 text-[9px]"
         style={{ colorScheme: 'dark' }}
       >
         <option value="default">{defaultLabel}</option>
@@ -256,7 +343,7 @@ const ClipInstrumentSelect: React.FC<{ clip: AudioClip }> = ({ clip }) => {
         aria-label={`Clip ${clip.label} instrument`}
         value={value}
         onChange={onChange}
-        className="flex-1 min-w-0 bg-zinc-900 border border-white/20 rounded px-1.5 py-1 text-[10px] text-zinc-100 outline-none focus:border-purple-500/60"
+        className="flex-1 min-w-0 form-select px-1.5 py-1 text-[10px]"
         style={{ colorScheme: 'dark' }}
       >
         <option value="default">{defaultLabel}</option>
@@ -329,6 +416,8 @@ const MarkerFlag: React.FC<{
       {editing ? (
         <input
           autoFocus
+          id={`marker-rename-${marker.t}`}
+          name="marker-rename"
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           onBlur={commit}
@@ -357,7 +446,37 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const selectedClipId = useEditorStore((s) => s.selectedClipId);
   const tool = useEditorStore((s) => s.tool);
   const zoom = useEditorStore((s) => s.zoom);
-  const playheadSec = useEditorStore((s) => s.playheadSec);
+  // Playhead: the live engine calls setPlayhead ~60x/sec during playback.
+  // SUBSCRIBING to playheadSec here would re-render the entire timeline (every
+  // clip + its per-sample waveform bars — thousands of nodes) each frame. Read it
+  // non-reactively for initial/re-render positioning, and drive the moving
+  // playhead line + timecode readouts imperatively via refs + a store
+  // subscription (see the effect just below). This is the dominant editor
+  // frame-time win for playback on any non-trivial project.
+  const playheadSec = useEditorStore.getState().playheadSec;
+  const rulerLineRef = useRef<HTMLDivElement>(null);
+  const rulerHandleRef = useRef<HTMLDivElement>(null);
+  const laneLineRef = useRef<HTMLDivElement>(null);
+  const headerTcRef = useRef<HTMLSpanElement>(null);
+  const footerTcRef = useRef<HTMLSpanElement>(null);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  useEffect(() => {
+    const apply = (sec: number) => {
+      const z = zoomRef.current;
+      const x = `${sec * z}px`;
+      if (rulerLineRef.current) rulerLineRef.current.style.left = x;
+      if (rulerHandleRef.current) rulerHandleRef.current.style.left = `${sec * z - 6}px`;
+      if (laneLineRef.current) laneLineRef.current.style.left = x;
+      const tc = formatTimecode(sec);
+      if (headerTcRef.current) headerTcRef.current.textContent = tc;
+      if (footerTcRef.current) footerTcRef.current.textContent = tc;
+    };
+    apply(useEditorStore.getState().playheadSec);
+    return useEditorStore.subscribe((s, prev) => {
+      if (s.playheadSec !== prev.playheadSec) apply(s.playheadSec);
+    });
+  }, []);
   const snap = useEditorStore((s) => s.snap);
   const setSelected = useEditorStore((s) => s.setSelected);
   const setTool = useEditorStore((s) => s.setTool);
@@ -377,9 +496,28 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const getTotalDurationSec = useEditorStore((s) => s.getTotalDurationSec);
   const masterGain = usePlaybackStore((s) => (s.muted ? 0 : s.volume / 100));
   const inpaintSelection = useEditorStore((s) => s.inpaintSelection);
+  // BPM/key per clip: audio clips resolve through the DJ analysis cache via
+  // their originating library entry (same source the DJ decks read); MIDI
+  // clips report their own render BPM. Read-only — nothing is queued here.
+  const djAnalysisById = useDjAnalysisStore((s) => s.byId);
   const setInpaintSelection = useEditorStore((s) => s.setInpaintSelection);
   const clearInpaintSelection = useEditorStore((s) => s.clearInpaintSelection);
   const masterFxChain = useEditorStore((s) => s.masterFxChain);
+  // Master VST3 chain (rendered/frozen, hosted via pedalboard) + scan list.
+  const masterVstChain = useEditorStore((s) => s.masterVstChain);
+  const addMasterVst = useEditorStore((s) => s.addMasterVst);
+  const setMasterVstRawState = useEditorStore((s) => s.setMasterVstRawState);
+  const setTrackVstRawState = useEditorStore((s) => s.setTrackVstRawState);
+  const removeMasterVst = useEditorStore((s) => s.removeMasterVst);
+  const reorderMasterVst = useEditorStore((s) => s.reorderMasterVst);
+  const clearMasterVst = useEditorStore((s) => s.clearMasterVst);
+  const previewMode = useEditorStore((s) => s.previewMode);
+  const setPreviewMode = useEditorStore((s) => s.setPreviewMode);
+  const frozenMaster = useEditorStore((s) => s.frozenMaster);
+  const setFrozenMaster = useEditorStore((s) => s.setFrozenMaster);
+  const vstPlugins = useVstStore((s) => s.plugins);
+  const vstScanning = useVstStore((s) => s.scanning);
+  const scanVst = useVstStore((s) => s.scan);
   const automationWrite = useEditorStore((s) => s.automationWrite);
   const setAutomationWrite = useEditorStore((s) => s.setAutomationWrite);
   const recordAutomationPoint = useEditorStore((s) => s.recordAutomationPoint);
@@ -464,6 +602,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   // Derived: are we currently playing the editor's rendered timeline?
   const isEditorPlaying = playerIsPlaying && playerEntryId === 'editor-timeline';
 
+  // The FX/fader overlay should visually follow the moving playhead ONLY during
+  // automation-READ playback with active lanes. Subscribe to playheadSec just for
+  // that narrow case, so ordinary playback (no lanes / write mode — the common
+  // case) never pays the per-frame re-render the playhead note above avoids.
+  const automationFollowActive =
+    isEditorPlaying && !automationWrite &&
+    automationLanes.some((l) => l.enabled && l.points.length > 0);
+  const followPlayhead = useEditorStore((s) => (automationFollowActive ? s.playheadSec : 0));
+
   // Sampled FX-param overrides for a rack entry at the current playhead, so its
   // controls visually follow automation during playback (display only; edits still
   // write the stored params).
@@ -480,12 +627,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         } else if (tgt.kind !== 'trackFx' || tgt.trackId !== scope.trackId) {
           continue;
         }
-        const v = sampleLane(lane, playheadSec);
+        const v = sampleLane(lane, followPlayhead);
         if (v != null) out[tgt.paramKey] = v;
       }
       return Object.keys(out).length ? out : undefined;
     },
-    [isEditorPlaying, automationWrite, automationLanes, playheadSec],
+    [isEditorPlaying, automationWrite, automationLanes, followPlayhead],
   );
 
   // Displayed value for a native (volume/pan) track fader: follows its lane during
@@ -496,7 +643,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       (l) => l.enabled && l.points.length > 0 && l.target.kind === kind && l.target.trackId === trackId,
     );
     if (!lane) return stored;
-    const v = sampleLane(lane, playheadSec);
+    const v = sampleLane(lane, followPlayhead);
     return v == null ? stored : v;
   };
 
@@ -550,8 +697,104 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const [isRendering, setIsRendering] = useState(false);
   const [mixdownName, setMixdownName] = useState('');
   const [showMasterFx, setShowMasterFx] = useState(false);
+  const [showMasterVst, setShowMasterVst] = useState(false);
+  const [isFreezing, setIsFreezing] = useState(false);
+  // Magenta RT2 generative tool open in the floating panel (Collider/Jam/MRT2), or null.
+  const [magentaToolId, setMagentaToolId] = useState<string | null>(null);
+  const magentaTool: MagentaTool | null = magentaToolId ? magentaToolById[magentaToolId] ?? null : null;
   const [showMetamorph, setShowMetamorph] = useState(false);
-  const [fxPanelTrackId, setFxPanelTrackId] = useState<string | null>(null);
+  // Per-track FX rack popover. x/y anchor it at the opening click (clip FX
+  // button, track-header F, context menu); both undefined falls back to the
+  // legacy right-4 top-28 position.
+  const [fxPanel, setFxPanel] = useState<{ trackId: string; x?: number; y?: number } | null>(null);
+  // The app-wide embedded native VST editor session (vstEditorStore hosts ONE
+  // editor window; leaving the owning tab closes it). EDIT hosts it in a
+  // floating popup only while EDIT owns it; MIX hosts it in its Effect Stage.
+  const vstSessionEntryId = useVstEditorStore((s) => s.entryId);
+  const vstSessionPath = useVstEditorStore((s) => s.pluginPath);
+  const vstSessionName = useVstEditorStore((s) => s.pluginName);
+  const vstSessionError = useVstEditorStore((s) => s.error);
+  const vstSessionOwnerTab = useVstEditorStore((s) => s.ownerTab);
+  // Natural editor size the loaded plugin reported (CSS px); sizes the floating
+  // popup to the plugin. Reset when the session switches plugins so a small
+  // editor never inherits the previous plugin's large box.
+  const [vstNatural, setVstNatural] = useState<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    setVstNatural(null);
+  }, [vstSessionPath]);
+  const onVstNaturalSize = useCallback((w: number, h: number) => {
+    setVstNatural((prev) => (prev && prev.w === w && prev.h === h ? prev : { w, h }));
+  }, []);
+  // Open a VST entry's REAL native GUI; the sink stores the captured raw_state
+  // on the right chain (a track's fxChain or the master VST chain).
+  const openVstEditor = (entry: ChainEntry, sink: (entryId: string, rawState: string) => void) =>
+    useVstEditorStore.getState().open(entry, sink);
+  // Clicking an available plugin adds it to the master VST chain (once) AND
+  // opens its GUI immediately (parity with MIX's browser). Re-clicking one
+  // already in the chain just (re)opens its editor instead of adding a duplicate.
+  const addAndEditMasterVst = (pl: Vst3PluginInfo) => {
+    let entry = useEditorStore.getState().masterVstChain.find((e) => e.vst?.plugin_path === pl.path);
+    if (!entry) {
+      addMasterVst({ plugin_path: pl.path, plugin_name: pl.name });
+      entry = [...useEditorStore.getState().masterVstChain].reverse().find((e) => e.vst?.plugin_path === pl.path);
+    }
+    if (entry) openVstEditor(entry, setMasterVstRawState);
+  };
+  // The Ares .gan control-surface popup and the chain entry (track or master
+  // scope) it drives while open.
+  const [aresPanel, setAresPanel] = useState<{ scope: { kind: 'master' } | { kind: 'track'; trackId: string }; entryId: string } | null>(null);
+  const ganActiveUrl = useGanStore((s) => s.activeUrl);
+  const ganActiveName = useGanStore((s) => s.activeName);
+  // Open the Ares surface for a specific 'ares' chain entry: package the bundled
+  // .gan on first use, open it in the popup's GanPluginStage, and route its
+  // controls onto THAT entry's params (see the bridge effect below).
+  const openAresSurface = (scope: { kind: 'master' } | { kind: 'track'; trackId: string }, entry: ChainEntry) => {
+    setAresPanel({ scope, entryId: entry.id });
+    void (async () => {
+      if (!useGanStore.getState().plugins.some((p) => p.id === 'ares')) await useGanStore.getState().ensureAres();
+      await useGanStore.getState().openById('ares');
+    })();
+  };
+  const closeAresSurface = () => {
+    setAresPanel(null);
+    useGanStore.getState().close();
+  };
+  // While the popup is open, EDIT owns the ONE app-wide Ares bridge; closing it
+  // releases ownership (MIX re-registers its own bridge on mount).
+  useEffect(() => {
+    if (!aresPanel) return;
+    const { scope, entryId } = aresPanel;
+    return registerAresBridge({
+      getXyPadId: () => {
+        const ares = useGanStore.getState().plugins.find((pl) => pl.id === 'ares');
+        return ares?.controls.find((c) => c.name === 'ares_xy_kaoss_pad')?.id ?? ARES_XY_PAD_FALLBACK_ID;
+      },
+      findEntry: () => {
+        const st = useEditorStore.getState();
+        const chain = scope.kind === 'track'
+          ? st.tracks.find((t) => t.id === scope.trackId)?.fxChain ?? []
+          : st.masterFxChain;
+        return chain.find((e) => e.id === entryId) ?? null;
+      },
+      updateParams: (id, params) => {
+        const st = useEditorStore.getState();
+        if (scope.kind === 'track') st.updateTrackEffectParams(scope.trackId, id, params);
+        else st.updateMasterEffectParams(id, params);
+      },
+    });
+  }, [aresPanel]);
+  // Mirror the open panel into a ref so the unmount-only cleanup below can see
+  // whether the popup was still open when EDIT unmounted.
+  const aresPanelRef = useRef(aresPanel);
+  aresPanelRef.current = aresPanel;
+  // Switching center tabs unmounts EDIT with the popup still open; the panel
+  // state dies with the component and the bridge effect above unregisters
+  // itself, but the app-wide ganStore session would otherwise leak, so the
+  // Ares surface would hijack MIX's Effect Stage while bound to EDIT's entry.
+  // Run closeAresSurface's remaining teardown (the ganStore close) on unmount.
+  useEffect(() => () => {
+    if (aresPanelRef.current) useGanStore.getState().close();
+  }, []);
   const [instrPanel, setInstrPanel] = useState<{ clipId: string; x: number; y: number } | null>(null);
   const instrPanelRef = useRef<HTMLDivElement>(null);
   // Outside-click / Escape dismiss the clip-instrument popover. Deferred a
@@ -654,6 +897,12 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
   const [selectedClipIds, setSelectedClipIds] = useState<string[]>([]);
   const [selectedTrackIds, setSelectedTrackIds] = useState<string[]>([]);
+
+  // Publish the track selection for non-React consumers (the Sway control
+  // surface's selection-following fader bank reads this).
+  useEffect(() => {
+    publishSelectedTracks(selectedTrackIds);
+  }, [selectedTrackIds]);
 
   // --- Inpaint panel state ---
   type InpaintPhase =
@@ -942,6 +1191,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       }
 
       for (const clip of selection) {
+        if (clip.muted) continue; // muted clips are excluded from the mashup, matching commitEdit and live playback
         const track = trackById.get(clip.trackId);
         if (!track || track.mute) continue;
         const buf = blobCache.get(clip.audioBlob);
@@ -1199,11 +1449,13 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
     clipMenu.open(e, { clipId, atSec });
   };
 
-  // OfflineAudioContext mixdown.
-  const commitEdit = useCallback(async () => {
+  // OfflineAudioContext mixdown. With { silent: true } it renders and RETURNS the
+  // master WAV without saving to the library or downloading — the VST freeze path
+  // reuses this so the frozen master matches the export exactly.
+  const commitEdit = useCallback(async (opts?: { silent?: boolean }): Promise<Blob | null> => {
     if (clips.length === 0) {
       logError('editor', 'No clips to commit');
-      return;
+      return null;
     }
     setIsCommitting(true);
     const start = performance.now();
@@ -1279,6 +1531,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       }
 
       for (const c of clips) {
+        if (c.muted) continue; // muted clips are excluded from the bounce, matching live playback
         const tn = trackNodeById.get(c.trackId);
         if (!tn) continue; // track muted or hidden by an active solo
         const buf = blobCache.get(c.audioBlob);
@@ -1320,7 +1573,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         );
         if (teleEntries.length === 0) continue;
         const insts = tn.fx.instances();
-        const trackClips = clips.filter((c) => c.trackId === track.id);
+        // Muted clips render no audio, so their onsets must not drive jumps.
+        const trackClips = clips.filter((c) => c.trackId === track.id && !c.muted);
         for (const entry of teleEntries) {
           const li = insts.find((x) => x.id === entry.id);
           if (!li?.inst.scheduleTeleport) continue;
@@ -1405,6 +1659,11 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
       const rendered = await offline.startRendering();
       const wavBlob = encodeWav(rendered);
+      // Freeze path: hand the rendered master back to the caller (it post-processes
+      // through the VST chain and caches it) without saving/downloading.
+      if (opts?.silent) {
+        return wavBlob;
+      }
       const id = `mix-${Date.now()}`;
       const trimmedName = mixdownName.trim();
       const title = trimmedName
@@ -1435,12 +1694,248 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
       const ms = (performance.now() - start).toFixed(0);
       logInfo('editor', `Mixdown complete: ${rendered.duration.toFixed(2)}s rendered in ${ms}ms → library + download`);
+      return wavBlob;
     } catch (e) {
       logError('editor', `Mixdown failed: ${e instanceof Error ? e.message : e}`);
+      return null;
     } finally {
       setIsCommitting(false);
     }
   }, [clips, tracks, getTotalDurationSec, mixdownName, masterFxChain]);
+
+  // --- Master VST freeze (render-on-change) ----------------------------------
+  const editorBpm = useEditorStore((s) => s.bpm);
+  // Populate the VST3 browser on first mount (cached scan — cheap).
+  useEffect(() => { void scanVst(false); }, [scanVst]);
+
+  // Signature of everything that affects the rendered master, so a frozen render
+  // can be flagged stale after edits (and re-renders are skipped when unchanged).
+  const freezeSig = useMemo(() => {
+    // A clip's muted flag is part of the shape because commitEdit drops muted
+    // clips from the bounce, so toggling mute changes the rendered master.
+    const clipPart = clips
+      .map((c) => `${c.id}:${c.trackId}:${c.startSec}:${c.durationSec}:${c.offsetIntoSource}:${c.fadeInSec ?? 0}:${c.fadeOutSec ?? 0}:${c.muted ? 1 : 0}:${c.audioBlob.size}`)
+      .join('|');
+    const trackPart = tracks
+      .map((t) => `${t.id}:${t.volume}:${t.pan}:${t.mute}:${t.solo}:${JSON.stringify(t.fxChain ?? [])}`)
+      .join('|');
+    return [clipPart, trackPart, JSON.stringify(masterFxChain), JSON.stringify(masterVstChain), editorBpm].join('::');
+  }, [clips, tracks, masterFxChain, masterVstChain, editorBpm]);
+
+  const frozenStale = !frozenMaster || frozenMaster.sig !== freezeSig;
+
+  // Render the master mix (silent commit), then post-process it through each
+  // enabled master VST on the backend (one /process-file call per node, in series).
+  const renderFrozenMaster = useCallback(async (): Promise<Blob | null> => {
+    const vsts = useEditorStore.getState().masterVstChain.filter((e) => e.enabled && e.vst);
+    if (vsts.length === 0) {
+      logError('editor', 'Add a master VST before rendering.');
+      return null;
+    }
+    if (clips.length === 0) {
+      logError('editor', 'No clips to render.');
+      return null;
+    }
+    setIsFreezing(true);
+    try {
+      const base = await commitEdit({ silent: true });
+      if (!base) return null;
+      let current = new File([base], 'edit-master.wav', { type: 'audio/wav' });
+      for (const node of vsts) {
+        const form = new FormData();
+        form.append('audio', current);
+        form.append('plugin_path', node.vst!.plugin_path);
+        form.append('params', '{}');
+        const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const j = (await res.json()) as { detail?: string };
+            if (j.detail) detail = j.detail;
+          } catch { /* non-JSON */ }
+          throw new Error(detail);
+        }
+        const blob = await res.blob();
+        current = new File([blob], 'edit-master.wav', { type: 'audio/wav' });
+      }
+      setFrozenMaster({ blob: current, sig: freezeSig });
+      logInfo('editor', `VST freeze rendered through ${vsts.length} plugin(s).`);
+      return current;
+    } catch (e) {
+      logError('editor', `VST freeze failed: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
+    } finally {
+      setIsFreezing(false);
+    }
+  }, [clips.length, commitEdit, setFrozenMaster, freezeSig]);
+
+  // Play the live multitrack mix again (re-arm liveMixer as the transport).
+  const enterLiveMode = useCallback(() => {
+    usePlayerStore.getState().stop();
+    liveMixer.reactivate();
+    setPreviewMode('live');
+  }, [setPreviewMode]);
+
+  // Switch to the frozen VST master; render first when stale/absent.
+  const enterFrozenMode = useCallback(async () => {
+    usePlayerStore.getState().stop();
+    let fm = useEditorStore.getState().frozenMaster;
+    if (!fm || fm.sig !== freezeSig) {
+      const blob = await renderFrozenMaster();
+      if (!blob) return; // failed — stay in the current mode
+      fm = useEditorStore.getState().frozenMaster;
+    }
+    if (!fm) return;
+    await usePlayerStore.getState().load(fm.blob, { label: 'EDIT · frozen VST master' });
+    setPreviewMode('frozen');
+  }, [freezeSig, renderFrozenMaster, setPreviewMode]);
+
+  // Re-render the frozen master in place (used by the "stale" button).
+  const reRenderFrozen = useCallback(async () => {
+    const blob = await renderFrozenMaster();
+    if (blob && useEditorStore.getState().previewMode === 'frozen') {
+      await usePlayerStore.getState().load(blob, { label: 'EDIT · frozen VST master' });
+    }
+  }, [renderFrozenMaster]);
+
+  // --- Per-track VST freeze ---------------------------------------------------
+  // Browser audio can't host VST3 live (the plugins run in pedalboard on the
+  // backend), so "freezing" a track renders it offline — its clips + live rack
+  // FX baked locally, then its VST3 chain applied in series on the backend — into
+  // one printed stem the normal clip path plays back. Mirrors the master freeze.
+  const renderTrackStem = useCallback(
+    async (
+      trackId: string,
+    ): Promise<{ audioBlob: Blob; durationSec: number; peaks: Float32Array } | null> => {
+      const st = useEditorStore.getState();
+      const track = st.tracks.find((t) => t.id === trackId);
+      if (!track) return null;
+      const trackClips = st.clips.filter((c) => c.trackId === trackId);
+      if (trackClips.length === 0) {
+        logError('editor', 'Track has no clips to freeze.');
+        return null;
+      }
+      const vsts = (track.fxChain ?? []).filter((e) => e.enabled && e.effect === 'vst3' && e.vst);
+      const dur = Math.max(...trackClips.map((c) => c.startSec + c.durationSec), 0.1);
+      const sr = 44100;
+      const offline = new OfflineAudioContext(2, Math.ceil(dur * sr), sr);
+
+      // Decode clips with a real AudioContext (more reliable than offline decode).
+      const blobCache = new Map<Blob, AudioBuffer>();
+      const decodeCtx = new AudioContext({ sampleRate: sr });
+      try {
+        for (const c of trackClips) {
+          if (!blobCache.has(c.audioBlob)) {
+            const ab = await c.audioBlob.arrayBuffer();
+            const decoded = await Promise.race([
+              decodeCtx.decodeAudioData(ab.slice(0)),
+              new Promise<never>((_, rej) =>
+                setTimeout(() => rej(new Error('decodeAudioData timeout')), DECODE_TIMEOUT_MS),
+              ),
+            ]);
+            blobCache.set(c.audioBlob, decoded);
+          }
+        }
+      } finally {
+        decodeCtx.close().catch(() => {});
+      }
+
+      // Bake the live rack effects (VST entries are applied on the backend after).
+      const rackChain = (track.fxChain ?? []).filter((e) => e.effect !== 'vst3');
+      if (rackChain.some((e) => e.effect === 'chop' && e.enabled)) {
+        try {
+          await ensureChopModule(offline);
+        } catch {
+          /* falls back to passthrough */
+        }
+      }
+      const trackInput = offline.createGain();
+      const fx = buildEffectChain(offline, trackInput, offline.destination, rackChain);
+      for (const c of trackClips) {
+        if (c.muted) continue; // muted clips stay out of the printed stem, matching live playback
+        const buf = blobCache.get(c.audioBlob);
+        if (!buf) continue;
+        const safeOffset = Math.min(c.offsetIntoSource, Math.max(0, buf.duration - 0.01));
+        const safeDur = Math.min(c.durationSec, buf.duration - safeOffset);
+        if (safeDur <= 0) continue;
+        const src = offline.createBufferSource();
+        src.buffer = buf;
+        const clipGain = offline.createGain();
+        const fadeIn = c.fadeInSec ?? 0;
+        const fadeOut = c.fadeOutSec ?? 0;
+        clipGain.gain.setValueAtTime(fadeIn > 0 ? 0 : 1, c.startSec);
+        if (fadeIn > 0) clipGain.gain.linearRampToValueAtTime(1, c.startSec + Math.min(fadeIn, safeDur));
+        if (fadeOut > 0) {
+          const fo = c.startSec + safeDur - Math.min(fadeOut, safeDur);
+          clipGain.gain.setValueAtTime(1, fo);
+          clipGain.gain.linearRampToValueAtTime(0, c.startSec + safeDur);
+        }
+        src.connect(clipGain).connect(trackInput);
+        src.start(c.startSec, safeOffset, safeDur);
+      }
+
+      let rendered: AudioBuffer;
+      try {
+        rendered = await offline.startRendering();
+      } finally {
+        fx.dispose();
+      }
+      let blob: Blob = encodeWav(rendered);
+
+      // VST3 chain on the backend, in signal-chain order.
+      let current = new File([blob], 'track-stem.wav', { type: 'audio/wav' });
+      for (const node of vsts) {
+        const form = new FormData();
+        form.append('audio', current);
+        form.append('plugin_path', node.vst!.plugin_path);
+        form.append('params', '{}');
+        if (node.vst!.raw_state) form.append('raw_state', node.vst!.raw_state);
+        const res = await fetch('/api/vst/process-file', { method: 'POST', body: form });
+        if (!res.ok) {
+          let detail = `HTTP ${res.status}`;
+          try {
+            const j = (await res.json()) as { detail?: string };
+            if (j.detail) detail = j.detail;
+          } catch {
+            /* non-JSON */
+          }
+          throw new Error(detail);
+        }
+        const out = await res.blob();
+        current = new File([out], 'track-stem.wav', { type: 'audio/wav' });
+        blob = out;
+      }
+
+      const { peaks } = await computePeaks(blob, 240);
+      return { audioBlob: blob, durationSec: dur, peaks };
+    },
+    [],
+  );
+
+  const freezeTrackAction = useCallback(
+    async (trackId: string) => {
+      setIsFreezing(true);
+      try {
+        usePlayerStore.getState().stop();
+        const stem = await renderTrackStem(trackId);
+        if (!stem) return;
+        useEditorStore.getState().freezeTrack(trackId, stem);
+        liveMixer.reactivate();
+        logInfo('editor', 'Track frozen — VST FX printed into the stem.');
+      } catch (e) {
+        logError('editor', `Track freeze failed: ${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        setIsFreezing(false);
+      }
+    },
+    [renderTrackStem],
+  );
+
+  const unfreezeTrackAction = useCallback((trackId: string) => {
+    usePlayerStore.getState().stop();
+    useEditorStore.getState().unfreezeTrack(trackId);
+    liveMixer.reactivate();
+  }, []);
 
   // --- Pointer math helpers. ---
   const pxToSec = useCallback((px: number) => px / zoom, [zoom]);
@@ -1784,8 +2279,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       clip.sourceBpm ?? 120,
       clip.sourceTotalSteps ?? 32,
     );
-    useBottomPanelStore.getState().showTab('piano-roll');
-    logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in Piano Roll (${clip.sourcePianoRoll.length} notes)`);
+    useBottomPanelStore.getState().showTab('midi');
+    logInfo('editor', `Editing clip ${clip.id.slice(0, 8)} in MIDI (${clip.sourcePianoRoll.length} notes)`);
   }, []);
 
   const onClipDoubleClick = (clip: AudioClip) => {
@@ -1965,7 +2460,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             <button onClick={() => setZoom(zoom - 5)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom out">
               <ZoomOut className="w-3 h-3" />
             </button>
-            <span className="text-[9px] font-mono text-zinc-400 w-12 text-center">{zoom}px/s</span>
+            <span className="text-[9px] font-mono text-zinc-400 w-14 text-center">{zoom.toFixed(2)}px/s</span>
             <button onClick={() => setZoom(zoom + 5)} className="p-1 hover:bg-white/5 rounded text-zinc-500" title="Zoom in">
               <ZoomIn className="w-3 h-3" />
             </button>
@@ -1993,6 +2488,29 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
             title="Master psychoacoustic insert rack (applies to the whole editor mix)"
           >
             <SlidersHorizontal className="w-3 h-3" /> MASTER FX
+          </button>
+
+          <button
+            onClick={() => setShowMasterVst((v) => !v)}
+            aria-pressed={showMasterVst}
+            aria-label="Master VST3 chain"
+            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors text-[9px] font-mono uppercase tracking-wider
+              ${showMasterVst || masterVstChain.length > 0 ? 'bg-teal-600/20 border-teal-500/40 text-teal-300' : 'border-white/5 text-zinc-500 hover:text-white hover:bg-white/5'}`}
+            title="Master VST3 chain — render the mix through VST plugins (freeze)"
+          >
+            <Plug className="w-3 h-3" /> VST
+            {previewMode === 'frozen' && <Snowflake className="w-2.5 h-2.5 text-cyan-300" />}
+          </button>
+
+          <button
+            onClick={() => setMagentaToolId((cur) => (cur ? null : MAGENTA_TOOLS[0].id))}
+            aria-pressed={!!magentaTool}
+            aria-label="Magenta RT2 generative tools"
+            title="Magenta RealTime 2 — generate audio (Collider · Jam · MRT2) via the Windows sidecar"
+            className={`flex items-center gap-1.5 p-1 px-2 rounded border transition-colors text-[9px] font-mono uppercase tracking-wider
+              ${magentaTool ? 'bg-cyan-600/20 border-cyan-500/40 text-cyan-300' : 'border-white/5 text-zinc-500 hover:text-white hover:bg-white/5'}`}
+          >
+            <Music className="w-3 h-3" /> MAGENTA
           </button>
 
           <button
@@ -2034,7 +2552,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           </button>
 
           <button
-            onClick={() => addMarker(playheadSec)}
+            onClick={() => addMarker(useEditorStore.getState().playheadSec)}
             aria-label="Add marker at playhead"
             title="Add a marker at the playhead (double-click a flag to rename, Alt-click to delete)"
             className="flex items-center gap-1.5 p-1 px-2 rounded border border-white/5 text-zinc-500 hover:text-white hover:bg-white/5 transition-colors text-[9px] font-mono uppercase tracking-wider"
@@ -2056,7 +2574,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
         <div className="flex items-center gap-3">
           <span className="text-[9px] font-mono text-zinc-500 tabular-nums">
-            {formatTimecode(playheadSec)} / {formatTimecode(totalDuration)}
+            <span ref={headerTcRef}>{formatTimecode(playheadSec)}</span> / {formatTimecode(totalDuration)}
           </span>
           <button
             onClick={() => isEditorPlaying ? stopEditorPlayback() : void playEditorTimeline()}
@@ -2103,8 +2621,103 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
 
       {/* MASTER FX + METAMORPH float as popups (like the per-track FX rack) so they
           never shove the timeline down; close with the X. */}
-      {(showMasterFx || showMetamorph) && (
+      {(showMasterFx || showMetamorph || showMasterVst) && (
         <div className="fixed top-28 left-4 z-50 flex items-start gap-3 max-w-[calc(100%-2rem)]">
+          {showMasterVst && (
+            <section aria-label="Master VST chain" className="w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-teal-500/30 rounded-lg shadow-2xl shadow-teal-900/40 p-3 flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
+                <span className="text-[10px] font-mono uppercase tracking-wider text-teal-300">Master VST</span>
+                <button onClick={() => setShowMasterVst(false)} aria-label="Close master VST panel" className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10"><X className="w-3.5 h-3.5" /></button>
+              </div>
+
+              {/* Live / Frozen toggle */}
+              <div className="flex items-center gap-1.5">
+                <button
+                  onClick={enterLiveMode}
+                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest transition-colors ${previewMode === 'live' ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
+                >
+                  <Play className="w-3 h-3" /> Live
+                </button>
+                <button
+                  onClick={() => void enterFrozenMode()}
+                  disabled={masterVstChain.length === 0 || clips.length === 0 || isFreezing}
+                  className={`flex-1 inline-flex items-center justify-center gap-1 px-2 py-1 rounded border text-[9px] font-black uppercase tracking-widest transition-colors disabled:opacity-40 ${previewMode === 'frozen' ? 'border-cyan-500/50 bg-cyan-500/15 text-cyan-100' : 'border-white/10 text-zinc-400 hover:bg-white/5'}`}
+                >
+                  {isFreezing ? <Loader2 className="w-3 h-3 animate-spin" /> : <Snowflake className="w-3 h-3" />} Frozen
+                </button>
+              </div>
+
+              {previewMode === 'frozen' && (
+                <button
+                  onClick={() => void reRenderFrozen()}
+                  disabled={isFreezing || !frozenStale}
+                  className="btn-ghost inline-flex items-center justify-center gap-1.5 disabled:opacity-40"
+                  title={frozenStale ? 'Re-render the master through the VST chain' : 'Frozen render is up to date'}
+                >
+                  {isFreezing ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                  {frozenStale ? 'Re-render (stale)' : 'Up to date'}
+                </button>
+              )}
+              <p className="text-[8px] text-zinc-600 leading-relaxed">
+                VSTs apply to the rendered master. Live plays the realtime mix (built-in rack only); Frozen plays the VST-processed render and re-renders after edits.
+              </p>
+
+              {/* Master VST chain */}
+              <div className="flex items-center justify-between">
+                <span className="mono-label">Chain ({masterVstChain.length})</span>
+                {masterVstChain.length > 0 && (
+                  <button onClick={() => { clearMasterVst(); enterLiveMode(); }} className="text-zinc-600 hover:text-red-400" title="Clear VST chain"><Trash2 className="w-3 h-3" /></button>
+                )}
+              </div>
+              {masterVstChain.length === 0 ? (
+                <p className="text-[9px] text-zinc-600 italic">No VSTs. Add one below.</p>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {masterVstChain.map((node, i) => (
+                    <div key={node.id} className="flex items-center gap-1.5 bg-black/40 border border-white/5 rounded px-1.5 py-1">
+                      <span className="text-[8px] font-mono text-teal-300/70 shrink-0">{i + 1}</span>
+                      <span className="flex-1 min-w-0 text-[9px] font-mono text-zinc-300 truncate">{node.vst?.plugin_name ?? 'VST'}</span>
+                      {node.vst && (
+                        <button
+                          onClick={() => openVstEditor(node, setMasterVstRawState)}
+                          aria-label={`Open ${node.vst.plugin_name} plugin GUI`}
+                          title={node.vst.raw_state ? 'Edit plugin GUI (custom settings saved)' : "Open the plugin's native GUI"}
+                          className={`p-0.5 shrink-0 ${node.vst.raw_state ? 'text-teal-400 hover:text-teal-300' : 'text-zinc-500 hover:text-teal-300'}`}
+                        >
+                          <SlidersHorizontal className="w-3 h-3" />
+                        </button>
+                      )}
+                      <button onClick={() => reorderMasterVst(i, i - 1)} disabled={i === 0} aria-label="Move up" className="p-0.5 text-zinc-500 hover:text-white disabled:opacity-30"><ChevronUp className="w-3 h-3" /></button>
+                      <button onClick={() => reorderMasterVst(i, i + 1)} disabled={i === masterVstChain.length - 1} aria-label="Move down" className="p-0.5 text-zinc-500 hover:text-white disabled:opacity-30"><ChevronDown className="w-3 h-3" /></button>
+                      <button onClick={() => removeMasterVst(node.id)} aria-label="Remove VST" className="p-0.5 text-zinc-500 hover:text-red-300"><X className="w-3 h-3" /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Available plugins */}
+              <div className="flex items-center justify-between border-t border-white/10 pt-2">
+                <span className="mono-label">Available ({vstPlugins.length})</span>
+                <button onClick={() => void scanVst(true)} disabled={vstScanning} className="btn-ghost inline-flex items-center gap-1 disabled:opacity-40" title="Rescan VST3 folders">
+                  {vstScanning ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />} Rescan
+                </button>
+              </div>
+              {vstPlugins.length === 0 ? (
+                <p className="text-[9px] text-zinc-600 italic">{vstScanning ? 'Scanning…' : 'No VST3 plugins found.'}</p>
+              ) : (
+                <div className="flex flex-col gap-1 max-h-40 overflow-y-auto">
+                  {vstPlugins.map((pl) => (
+                    <button key={pl.path} onClick={() => addAndEditMasterVst(pl)} title={pl.path}
+                      className="flex items-center gap-1.5 bg-black/30 border border-white/5 rounded px-1.5 py-1 text-left hover:bg-white/5">
+                      <Plug className="w-3 h-3 text-teal-300 shrink-0" />
+                      <span className="flex-1 min-w-0 text-[9px] font-mono text-zinc-300 truncate">{pl.name}</span>
+                      <Plus className="w-3 h-3 text-zinc-500 shrink-0" />
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
           {showMasterFx && (
             <section aria-label="Master FX rack" className="w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2">
               <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
@@ -2127,6 +2740,8 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 onUpdateParams={(id, p) => writeFxParams({ kind: 'master' }, id, p)}
                 projectBpm={projectBpm}
                 displayParams={(id) => fxDisplayParams({ kind: 'master' }, id)}
+                onOpenVst={(entry) => openVstEditor(entry, setMasterVstRawState)}
+                onOpenSurface={(entry) => openAresSurface({ kind: 'master' }, entry)}
               />
             </section>
           )}
@@ -2150,18 +2765,64 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         </div>
       )}
 
-      {/* Per-track FX rack (floating; fixed so it escapes the card's overflow clip) */}
-      {fxPanelTrackId && (() => {
-        const t = tracks.find((tr) => tr.id === fxPanelTrackId);
+      {/* Magenta RT2 generative tools (floating; large enough for the 780×504
+          instrument). The picked tool's EXACT Google UI is embedded via
+          MagentaToolStage and driven by the bridge shim → /api/magenta. */}
+      {magentaTool && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6" role="dialog" aria-label="Magenta RT2 tools" onMouseDown={() => setMagentaToolId(null)}>
+          <section
+            className="hardware-card bg-black/95 border border-cyan-500/30 rounded-lg shadow-2xl shadow-cyan-900/40 flex flex-col overflow-hidden"
+            style={{ width: 'min(900px, 92vw)', height: 'min(620px, 88vh)' }}
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2 shrink-0">
+              <Music className="w-3.5 h-3.5 text-cyan-300" />
+              <span className="text-[10px] font-mono uppercase tracking-wider text-cyan-300">Magenta RT2</span>
+              <div className="flex items-center gap-1 ml-2">
+                {MAGENTA_TOOLS.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => setMagentaToolId(t.id)}
+                    title={t.desc}
+                    className={`px-2 py-0.5 rounded text-[9px] font-bold uppercase tracking-wider border transition-colors ${magentaTool.id === t.id ? 'bg-cyan-600/20 border-cyan-500/40 text-cyan-200' : 'border-white/8 text-zinc-500 hover:text-zinc-200 hover:bg-white/5'}`}
+                  >
+                    {t.name}
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={() => setMagentaToolId(null)}
+                aria-label="Close Magenta tools"
+                className="ml-auto p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="flex-1 min-h-0">
+              <MagentaToolStage tool={magentaTool} />
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* Per-track FX rack (floating popover, portaled to body so it opens AT
+          the click even under the .dense-layout CSS zoom) */}
+      {fxPanel && (() => {
+        const t = tracks.find((tr) => tr.id === fxPanel.trackId);
         if (!t) return null;
         return (
-          <div className="fixed right-4 top-28 z-50 w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2">
+          <PopoverPortal
+            x={fxPanel.x}
+            y={fxPanel.y}
+            anchorClassName="right-4 top-28"
+            className="fixed z-50 w-90 max-h-[70vh] overflow-y-auto hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
+          >
             <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
               <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 truncate">
                 Track FX — <span style={{ color: t.color }}>{t.name}</span>
               </span>
               <button
-                onClick={() => setFxPanelTrackId(null)}
+                onClick={() => setFxPanel(null)}
                 aria-label="Close track FX rack"
                 title="Close"
                 className="p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10 shrink-0"
@@ -2179,10 +2840,71 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               onUpdateParams={(id, p) => writeFxParams({ kind: 'track', trackId: t.id }, id, p)}
               projectBpm={projectBpm}
               displayParams={(id) => fxDisplayParams({ kind: 'track', trackId: t.id }, id)}
+              onOpenVst={(entry) => openVstEditor(entry, (entryId, raw) => setTrackVstRawState(t.id, entryId, raw))}
+              onOpenSurface={(entry) => openAresSurface({ kind: 'track', trackId: t.id }, entry)}
             />
-          </div>
+          </PopoverPortal>
         );
       })()}
+
+      {/* Embedded native VST editor (floating hardware-card popup, offset below
+          the top-28 FX panels so both can be open). Rendered only while EDIT
+          owns the ONE app-wide embed session; the same VstEmbedHost drives the
+          native OS window in MIX's Effect Stage. Portaled to document.body:
+          outside the CSS-zoomed .dense-layout one CSS px equals one viewport
+          px, so the plugin's reported natural size maps 1:1 onto the popup with
+          no zoom-factor division. Sized to the plugin once it reports (plus the
+          host chrome), clamped to the viewport with the host's inner scroll for
+          oversized editors; 640x480 is the pre-report fallback. */}
+      {vstSessionEntryId && vstSessionPath && vstSessionName && vstSessionOwnerTab === 'edit' && createPortal(
+        <div
+          className="fixed left-1/2 -translate-x-1/2 top-36 z-50 hardware-card bg-black/95 border border-teal-500/30 rounded-lg shadow-2xl shadow-teal-900/40 overflow-hidden"
+          style={
+            vstNatural
+              ? {
+                  // Host chrome around the plugin viewport: popup border (2),
+                  // VstEmbedHost padding (16) + inner border (2) horizontally;
+                  // plus the header row (~18) and its gap (8) vertically.
+                  width: `min(${vstNatural.w + 20}px, 92vw)`,
+                  height: `min(${vstNatural.h + 46}px, 85vh)`,
+                }
+              : { width: 'min(640px, 92vw)', height: 'min(480px, 72vh)' }
+          }
+        >
+          <VstEmbedHost
+            pluginPath={vstSessionPath}
+            pluginName={vstSessionName}
+            error={vstSessionError ?? undefined}
+            onClose={() => useVstEditorStore.getState().close()}
+            onNaturalSize={onVstNaturalSize}
+          />
+        </div>,
+        document.body,
+      )}
+
+      {/* Ares control surface (floating popup); its .gan drives the picked
+          'ares' chain entry's params through the shared bridge while open. */}
+      {aresPanel && (
+        <div
+          className="fixed left-1/2 -translate-x-1/2 top-36 z-50 hardware-card bg-black/95 border border-indigo-500/30 rounded-lg shadow-2xl shadow-indigo-900/40 flex flex-col overflow-hidden"
+          style={{ width: 'min(720px, 92vw)', height: 'min(520px, 72vh)' }}
+        >
+          <div className="flex items-center gap-2 border-b border-white/10 px-3 py-2 shrink-0">
+            <Blocks className="w-3.5 h-3.5 text-indigo-300" />
+            <span className="text-[10px] font-mono uppercase tracking-wider text-indigo-300">Ares Surface</span>
+            <button
+              onClick={closeAresSurface}
+              aria-label="Close Ares surface"
+              className="ml-auto p-0.5 rounded text-zinc-500 hover:text-white hover:bg-white/10"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          <div className="flex-1 min-h-0">
+            <GanPluginStage url={ganActiveUrl} name={ganActiveName} />
+          </div>
+        </div>
+      )}
 
       {/* Automation lane panel (floating; while automation edit mode is on) */}
       {automationEdit && (
@@ -2255,17 +2977,17 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         </div>
       )}
 
-      {/* Per-clip instrument override (floating; MIDI clips only) */}
+      {/* Per-clip instrument override (floating; MIDI clips only). Portaled to
+          body so the click-position anchor holds under the layout zoom. */}
       {instrPanel && (() => {
         const clip = clips.find((c) => c.id === instrPanel.clipId);
         if (!clip) return null;
-        const left = Math.max(8, Math.min(instrPanel.x, window.innerWidth - 280));
-        const top = Math.max(8, Math.min(instrPanel.y, window.innerHeight - 96));
         return (
-          <div
-            ref={instrPanelRef}
+          <PopoverPortal
+            x={instrPanel.x}
+            y={instrPanel.y}
+            innerRef={instrPanelRef}
             className="fixed z-50 w-66 hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
-            style={{ left, top }}
           >
             <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
               <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 truncate">
@@ -2281,21 +3003,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               </button>
             </div>
             <ClipInstrumentSelect clip={clip} />
-          </div>
+          </PopoverPortal>
         );
       })()}
 
-      {/* Per-clip Time / Pitch popover (audio clips) */}
+      {/* Per-clip Time / Pitch popover (audio clips). Portaled to body so the
+          click-position anchor holds under the layout zoom. */}
       {timePitchPanel && (() => {
         const clip = clips.find((c) => c.id === timePitchPanel.clipId);
         if (!clip) return null;
-        const left = Math.max(8, Math.min(timePitchPanel.x, window.innerWidth - 300));
-        const top = Math.max(8, Math.min(timePitchPanel.y, window.innerHeight - 170));
         return (
-          <div
-            ref={timePitchRef}
+          <PopoverPortal
+            x={timePitchPanel.x}
+            y={timePitchPanel.y}
+            innerRef={timePitchRef}
             className="fixed z-50 w-72 hardware-card bg-black/90 border border-purple-500/30 rounded-lg shadow-2xl shadow-purple-900/40 p-3 flex flex-col gap-2"
-            style={{ left, top }}
           >
             <div className="flex items-center justify-between gap-2 border-b border-white/10 pb-2">
               <span className="text-[10px] font-mono uppercase tracking-wider text-zinc-400 truncate">
@@ -2314,7 +3036,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               busy={timePitchBusy}
               onApply={(tempo, semitones) => { void applyTimePitch(timePitchPanel.clipId, tempo, semitones).then(() => setTimePitchPanel(null)); }}
             />
-          </div>
+          </PopoverPortal>
         );
       })()}
 
@@ -2347,20 +3069,63 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                   />
                   <div className="flex gap-1 shrink-0">
                     <button
+                      onClick={() => updateTrack(t.id, { armed: !t.armed })}
+                      aria-label={`Arm track ${t.name} for recording`}
+                      aria-pressed={!!t.armed}
+                      title="Arm for recording"
+                      className={`w-4 h-4 rounded-full flex items-center justify-center border ${t.armed ? 'bg-red-500/30 text-red-400 border-red-500/60' : 'bg-black/40 text-zinc-500 border-white/10 hover:text-white'}`}
+                    >
+                      <Circle className={`w-2 h-2 ${t.armed ? 'fill-red-500' : ''}`} />
+                    </button>
+                    <button
                       onClick={() => updateTrack(t.id, { mute: !t.mute })}
+                      aria-label={`Mute track ${t.name}`}
+                      aria-pressed={t.mute}
                       className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${t.mute ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >M</button>
                     <button
                       onClick={() => toggleSolo(t.id)}
+                      aria-label={`Solo track ${t.name}`}
+                      aria-pressed={t.solo}
                       className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${t.solo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >S</button>
                     <button
-                      onClick={() => setFxPanelTrackId((cur) => (cur === t.id ? null : t.id))}
+                      onClick={(e) =>
+                        setFxPanel((cur) =>
+                          cur?.trackId === t.id ? null : { trackId: t.id, x: e.clientX, y: e.clientY },
+                        )
+                      }
                       aria-label={`Track ${t.name} insert FX`}
-                      aria-pressed={fxPanelTrackId === t.id}
+                      aria-pressed={fxPanel?.trackId === t.id}
                       title="Track insert FX rack"
-                      className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${(t.fxChain?.length ?? 0) > 0 || fxPanelTrackId === t.id ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
+                      className={`w-4 h-4 rounded text-[8px] font-bold flex items-center justify-center ${(t.fxChain?.length ?? 0) > 0 || fxPanel?.trackId === t.id ? 'bg-purple-500/20 text-purple-300 border border-purple-500/50' : 'bg-black/40 text-zinc-500 border border-white/5 hover:text-white'}`}
                     >F</button>
+                    {(t.frozenOriginal || (t.fxChain ?? []).some((e) => e.effect === 'vst3' && e.vst)) && (
+                      <button
+                        onClick={() =>
+                          t.frozenOriginal ? unfreezeTrackAction(t.id) : void freezeTrackAction(t.id)
+                        }
+                        disabled={isFreezing}
+                        aria-label={
+                          t.frozenOriginal
+                            ? `Unfreeze track ${t.name}`
+                            : `Freeze track ${t.name} to print VST FX`
+                        }
+                        aria-pressed={!!t.frozenOriginal}
+                        title={
+                          t.frozenOriginal
+                            ? 'Unfreeze (restore live clips + FX)'
+                            : 'Freeze: print VST3/effects into audio so the plugin is audible'
+                        }
+                        className={`w-4 h-4 rounded flex items-center justify-center border disabled:opacity-40 ${t.frozenOriginal ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/50' : 'bg-black/40 text-zinc-500 border-white/5 hover:text-white'}`}
+                      >
+                        {isFreezing ? (
+                          <Loader2 className="w-2 h-2 animate-spin" />
+                        ) : (
+                          <Snowflake className="w-2 h-2" />
+                        )}
+                      </button>
+                    )}
                     <button
                       onClick={() => removeTrack(t.id)}
                       className="w-4 h-4 rounded text-[8px] flex items-center justify-center bg-black/40 text-zinc-600 border border-white/5 hover:text-red-400"
@@ -2441,12 +3206,15 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                 onDelete={() => removeMarker(m.id)}
               />
             ))}
-            {/* Playhead in ruler: line + draggable triangle handle */}
+            {/* Playhead in ruler: line + draggable triangle handle (position is
+                driven imperatively during playback — see the playhead effect) */}
             <div
+              ref={rulerLineRef}
               className="absolute top-0 bottom-0 w-px bg-red-500/60 pointer-events-none z-20"
               style={{ left: playheadSec * zoom }}
             />
             <div
+              ref={rulerHandleRef}
               data-playhead-handle="1"
               className="absolute bottom-0 z-30 cursor-ew-resize"
               style={{ left: playheadSec * zoom - 6, width: 13 }}
@@ -2493,8 +3261,21 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               const top = trackIdx * TRACK_HEIGHT + 6;
               const height = TRACK_HEIGHT - 12;
               const selected = selectedClipIdSet.has(clip.id) || clip.id === selectedClipId;
-              const peaks = clip.peaks;
               const isMidi = clip.sourceKind === 'piano-roll' && !!clip.sourcePianoRoll && clip.sourcePianoRoll.length > 0;
+              // Compact BPM/key readout: MIDI clips carry their render BPM; audio
+              // clips resolve through the DJ analysis cache. Hidden entirely on
+              // narrow clips or when neither value is known.
+              let bpmText: string | null = null;
+              let keyText: string | null = null;
+              if (clip.sourceKind === 'piano-roll') {
+                if (clip.sourceBpm) bpmText = String(Math.round(clip.sourceBpm));
+              } else if (clip.libraryEntryId) {
+                const d = djAnalysisById[clip.libraryEntryId]?.data;
+                if (d?.bpm) bpmText = String(Math.round(d.bpm));
+                if (d?.key) keyText = `${d.key}${(d.scale ?? '').toLowerCase().startsWith('min') ? 'm' : ''}`;
+              }
+              const bpmKeyReadout =
+                width >= 120 && (bpmText || keyText) ? [bpmText, keyText].filter(Boolean).join(' . ') : null;
               return (
                 <div
                   key={clip.id}
@@ -2518,24 +3299,47 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
                       )}
                       <span className="text-white truncate">{clip.label}</span>
                     </span>
-                    <span className="text-zinc-300">{clip.durationSec.toFixed(2)}s</span>
-                  </div>
-                  {/* Body: MIDI clips show their notes (FL-style); audio clips show peaks */}
-                  {isMidi ? (
-                    <MidiClipNotes clip={clip} zoom={zoom} selected={selected} />
-                  ) : (
-                    <div className="absolute inset-x-0 bottom-0 top-3.5 flex items-center gap-[0.5px] px-1">
-                      {peaks ? (
-                        Array.from(peaks).map((v, i) => (
-                          <div
-                            key={i}
-                            className="flex-1 rounded-sm"
-                            style={{ height: `${Math.max(2, v * 90)}%`, backgroundColor: clip.color, opacity: selected ? 0.95 : 0.7 }}
-                          />
-                        ))
-                      ) : (
-                        <span className="text-[8px] font-mono text-zinc-600 italic">decoding…</span>
+                    <span className="flex items-center gap-1 shrink-0">
+                      {bpmKeyReadout && (
+                        <span className="text-zinc-400 normal-case tabular-nums">{bpmKeyReadout}</span>
                       )}
+                      {/* Header buttons stop pointerdown so they never start a
+                          clip drag, and stop click so they never re-select. */}
+                      <button
+                        type="button"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onDoubleClick={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFxPanel({ trackId: clip.trackId, x: e.clientX, y: e.clientY });
+                        }}
+                        aria-label={`Open track FX for clip ${clip.label}`}
+                        className="px-0.5 h-3 rounded-sm text-[7px] font-bold leading-none flex items-center bg-black/40 text-zinc-400 border border-white/10 hover:text-purple-300 hover:border-purple-500/50"
+                      >FX</button>
+                      <button
+                        type="button"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onDoubleClick={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          updateClip(clip.id, { muted: !clip.muted });
+                        }}
+                        aria-label={`Mute clip ${clip.label}`}
+                        aria-pressed={!!clip.muted}
+                        className={`px-0.5 h-3 rounded-sm text-[7px] font-bold leading-none flex items-center ${clip.muted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-black/40 text-zinc-400 border border-white/10 hover:text-white'}`}
+                      >M</button>
+                      <span className="text-zinc-300">{clip.durationSec.toFixed(2)}s</span>
+                    </span>
+                  </div>
+                  {/* Body: MIDI clips show their notes (FL-style); audio clips show
+                      peaks. A muted clip's body is dimmed (the red M is the flag). */}
+                  {isMidi ? (
+                    <div className={clip.muted ? 'opacity-30' : ''}>
+                      <MidiClipNotes clip={clip} zoom={zoom} selected={selected} />
+                    </div>
+                  ) : (
+                    <div className={`absolute inset-x-0 bottom-0 top-3.5 ${clip.muted ? 'opacity-30' : ''}`}>
+                      <ClipWave clip={clip} height={Math.max(8, height - 14)} selected={selected} />
                     </div>
                   )}
                   {/* Inpaint drag target — covers waveform body below header.
@@ -2688,8 +3492,9 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               />
             )}
 
-            {/* Playhead line in track lanes */}
+            {/* Playhead line in track lanes (position driven imperatively) */}
             <div
+              ref={laneLineRef}
               className="absolute top-0 bottom-0 w-px bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.6)] z-30 pointer-events-none"
               style={{ left: playheadSec * zoom }}
             />
@@ -2709,7 +3514,7 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
       <div className="h-6 border-t border-white/5 bg-black/60 flex items-center justify-between px-3 shrink-0">
         <div className="flex items-center gap-3">
           <span className="text-[9px] font-mono text-zinc-500 tabular-nums">
-            {formatTimecode(playheadSec)} / {formatTimecode(totalDuration)}
+            <span ref={footerTcRef}>{formatTimecode(playheadSec)}</span> / {formatTimecode(totalDuration)}
           </span>
           <span className="text-[8px] font-mono text-zinc-600">
             {clips.length} clips · {tracks.length} tracks
@@ -2846,12 +3651,37 @@ export const WaveformEditor: React.FC<{ onSwitchTab?: (tab: string) => void }> =
         const t = tracks.find((tr) => tr.id === trackMenu.payload?.trackId);
         if (!t) return null;
         const hasFx = (t.fxChain?.length ?? 0) > 0;
+        // Style prompt + lyrics come from the originating library entry of any
+        // clip on this track (Suno tracks carry them; derived best-effort).
+        const clipWithEntry = clips.find((c) => c.trackId === t.id && c.libraryEntryId);
+        const srcEntry = clipWithEntry?.libraryEntryId
+          ? useLibraryStore.getState().entries.find((e) => e.id === clipWithEntry.libraryEntryId)
+          : null;
+        const styleText = srcEntry ? deriveStyle(srcEntry).trim() : '';
+        const lyricsText = srcEntry ? deriveLyrics(srcEntry).trim() : '';
         const items: ContextMenuItem[] = [
+          {
+            type: 'item',
+            icon: <Copy className="w-3 h-3" />,
+            label: 'Copy style prompt',
+            disabled: !styleText,
+            onSelect: () => { if (styleText) void navigator.clipboard.writeText(styleText); },
+          },
+          {
+            type: 'item',
+            icon: <Copy className="w-3 h-3" />,
+            label: 'Copy lyrics',
+            disabled: !lyricsText,
+            onSelect: () => { if (lyricsText) void navigator.clipboard.writeText(lyricsText); },
+          },
+          { type: 'separator' },
           {
             type: 'item',
             icon: <SlidersHorizontal className="w-3 h-3" />,
             label: 'Open FX rack',
-            onSelect: () => setFxPanelTrackId(t.id),
+            // Anchor the rack at the right-click that opened this menu; the
+            // legacy right-4 top-28 spot is the no-coords fallback.
+            onSelect: () => setFxPanel({ trackId: t.id, x: trackMenu.position?.x, y: trackMenu.position?.y }),
           },
           { type: 'separator' },
           { type: 'header', label: 'Add insert' },

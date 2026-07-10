@@ -1,8 +1,9 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Zap, Target, Settings2, Maximize2 } from 'lucide-react';
+import { Zap, Target, Maximize2, Minimize2 } from 'lucide-react';
 import { getAnalyser, getEngineCtx, samplePeakAndRMS } from '../../state/playerStore';
+import { QuantumLatticeView } from './QuantumLatticeView';
 
-type Mode = 'oscilloscope' | 'spectrum' | 'radial';
+type Mode = 'oscilloscope' | 'spectrum' | 'radial' | 'quantum';
 
 const OVERLAY_RESERVE_HEIGHT = 18;
 
@@ -19,6 +20,18 @@ export const AdvancedVisualizer: React.FC = () => {
   const [peakDb, setPeakDb] = useState(-Infinity);
   const [rmsDb, setRmsDb] = useState(-Infinity);
   const [ctxInfo, setCtxInfo] = useState<{ sr: number; fft: number }>({ sr: 44100, fft: 2048 });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  // Track whether THIS instance's wrapper is the fullscreen element. The
+  // component mounts in several hosts at once, so the state must compare
+  // against the instance's own ref rather than a global boolean.
+  useEffect(() => {
+    const onFullscreenChange = () => {
+      setIsFullscreen(document.fullscreenElement === wrapperRef.current);
+    };
+    document.addEventListener('fullscreenchange', onFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange);
+  }, []);
 
   // Resize the canvas to its container, accounting for device pixel ratio.
   useEffect(() => {
@@ -95,7 +108,7 @@ export const AdvancedVisualizer: React.FC = () => {
           ctx2d.fillStyle = grad;
           ctx2d.fillRect(x + 0.5, floor - barH, Math.max(1, barWidth - 1), barH);
         }
-      } else {
+      } else if (mode === 'radial') {
         analyser.getByteFrequencyData(freqBuf);
         const cx = w / 2;
         const cy = h / 2;
@@ -134,8 +147,8 @@ export const AdvancedVisualizer: React.FC = () => {
     return () => cancelAnimationFrame(rafRef.current);
   }, [mode]);
 
-  const modeLabels: Record<Mode, string> = { oscilloscope: 'O', spectrum: 'S', radial: 'R' };
-  const modeTitles: Record<Mode, string> = { oscilloscope: 'Oscilloscope', spectrum: 'Spectrum', radial: 'Radial' };
+  const modeLabels: Record<Mode, string> = { oscilloscope: 'O', spectrum: 'S', radial: 'R', quantum: 'Q' };
+  const modeTitles: Record<Mode, string> = { oscilloscope: 'Oscilloscope', spectrum: 'Spectrum', radial: 'Radial', quantum: 'Quantum Lattice' };
 
   return (
     <div className="hardware-card h-full flex flex-col bg-black/40 relative overflow-hidden group">
@@ -152,9 +165,12 @@ export const AdvancedVisualizer: React.FC = () => {
       <div ref={wrapperRef} className="flex-1 min-h-0 relative">
         <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" />
 
-        {/* O / S / R mode buttons — vertical column, top-left */}
+        {/* Quantum Lattice WebGL mode overlays the 2D canvas when selected */}
+        {mode === 'quantum' && <QuantumLatticeView />}
+
+        {/* O / S / R / Q mode buttons — vertical column, top-left */}
         <div className="absolute top-2 left-2 flex flex-col gap-1 z-10">
-          {(['oscilloscope', 'spectrum', 'radial'] as const).map((m) => (
+          {(['oscilloscope', 'spectrum', 'radial', 'quantum'] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
@@ -211,17 +227,18 @@ export const AdvancedVisualizer: React.FC = () => {
           <div className="w-px h-3 bg-white/15" />
 
           <div className="flex gap-0.5">
-            <button className="p-0.5 hover:bg-white/15 rounded text-zinc-500 hover:text-zinc-200 transition-colors">
-              <Settings2 className="w-3 h-3" />
-            </button>
             <button
+              type="button"
+              title={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              aria-label={isFullscreen ? 'Exit fullscreen' : 'Fullscreen'}
+              aria-pressed={isFullscreen}
               className="p-0.5 hover:bg-white/15 rounded text-zinc-500 hover:text-zinc-200 transition-colors"
               onClick={() => {
-                if (document.fullscreenElement) void document.exitFullscreen();
-                else void wrapperRef.current?.requestFullscreen();
+                if (isFullscreen) void document.exitFullscreen().catch(() => {});
+                else void wrapperRef.current?.requestFullscreen().catch(() => {});
               }}
             >
-              <Maximize2 className="w-3 h-3" />
+              {isFullscreen ? <Minimize2 className="w-3 h-3" /> : <Maximize2 className="w-3 h-3" />}
             </button>
           </div>
         </div>

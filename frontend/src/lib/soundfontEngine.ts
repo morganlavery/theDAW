@@ -43,8 +43,10 @@ export const useSoundfontStore = create<SoundfontState>((set) => ({
   ready: false,
   loading: false,
   loadError: null,
-  useSoundfont: false,
-  activeProgram: 0,
+  // Default to the bundled soundfont's Bright Acoustic Piano (GM program 1)
+  // instead of the raw sawtooth; falls back to the sawtooth if it fails to load.
+  useSoundfont: true,
+  activeProgram: 1,
   activeSynthVoice: null,
   // The three instrument modes are mutually exclusive: a soundfont program, a
   // procedural synth voice, or neither ("basic" sawtooth).
@@ -96,7 +98,9 @@ function getLiveSynth(): Promise<WorkletSynthesizer> {
       const synth = new WorkletSynthesizer(ctx);
       synth.connect(getMasterGain());
       const sf = await loadDefaultSoundfont();
-      await synth.soundBankManager.addSoundBank(sf, 'main');
+      // Pass a copy: the worklet transfers (detaches) the buffer it receives, and
+      // the cached `sf` is reused by the offline render path too.
+      await synth.soundBankManager.addSoundBank(sf.slice(0), 'main');
       await synth.isReady;
       liveSynth = synth;
       channelProgram.clear();
@@ -165,7 +169,9 @@ async function renderMidiToBlob(
   synth.connect(ctx.destination);
   await synth.startOfflineRender({
     midiSequence: midi,
-    soundBankList: [{ bankOffset: 0, soundBankBuffer: sf }],
+    // Copy: startOfflineRender transfers (detaches) the buffer, but `sf` is the
+    // shared cached soundfont reused by the live synth and later renders.
+    soundBankList: [{ bankOffset: 0, soundBankBuffer: sf.slice(0) }],
     loopCount: 0,
   });
   await synth.isReady;

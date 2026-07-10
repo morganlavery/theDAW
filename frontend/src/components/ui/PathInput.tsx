@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
-import { FolderOpen, FileSearch, Loader2 } from 'lucide-react';
-import { pickFile, pickFolder } from '../../lib/storageClient';
+import { FolderOpen, FileSearch, Save, Loader2 } from 'lucide-react';
+import { pickFile, pickFolder, pickSave } from '../../lib/storageClient';
 
 interface PathInputProps {
   id: string;
@@ -8,17 +8,38 @@ interface PathInputProps {
   label: string;
   value: string;
   onChange: (value: string) => void;
-  kind: 'folder' | 'file';
+  /** 'save' opens a native Save As dialog (for choosing a destination path). */
+  kind: 'folder' | 'file' | 'save';
   placeholder?: string;
   description?: string;
   disabled?: boolean;
   onBlur?: () => void;
   onEnter?: () => void;
+  onFocus?: () => void;
+  onClick?: () => void;
+  /** Runs before the built-in Enter handling; call e.preventDefault() to
+   *  suppress the built-in Enter behavior (onEnter / blur). */
+  onKeyDown?: (e: React.KeyboardEvent<HTMLInputElement>) => void;
+  /** ARIA passthroughs for call sites that attach a popup (e.g. a combobox
+   *  with a recent-items listbox). Undefined values render no attribute, so
+   *  existing call sites are unaffected. */
+  role?: React.AriaRole;
+  ariaExpanded?: boolean;
+  ariaControls?: string;
+  ariaActiveDescendant?: string;
+  ariaAutocomplete?: React.AriaAttributes['aria-autocomplete'];
   className?: string;
   /** Render label + input on one row (compact). Implies descriptionHover. */
   inline?: boolean;
   /** Move the description into a hover tooltip instead of a visible paragraph. */
   descriptionHover?: boolean;
+  /** OpenFileDialog filter for kind='file'/'save' (e.g. project/audio types).
+   *  Defaults to all files on the backend when omitted. */
+  fileFilter?: string;
+  /** kind='save' only: suggested file name, default extension, and start folder. */
+  saveName?: string;
+  saveExt?: string;
+  saveDir?: string;
 }
 
 export const PathInput: React.FC<PathInputProps> = ({
@@ -33,9 +54,21 @@ export const PathInput: React.FC<PathInputProps> = ({
   disabled = false,
   onBlur,
   onEnter,
+  onFocus,
+  onClick,
+  onKeyDown,
+  role,
+  ariaExpanded,
+  ariaControls,
+  ariaActiveDescendant,
+  ariaAutocomplete,
   className = '',
   inline = false,
   descriptionHover = false,
+  fileFilter,
+  saveName,
+  saveExt,
+  saveDir,
 }) => {
   const [picking, setPicking] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -45,7 +78,17 @@ export const PathInput: React.FC<PathInputProps> = ({
     setPicking(true);
     setError(null);
     try {
-      const result = kind === 'folder' ? await pickFolder() : await pickFile();
+      const result =
+        kind === 'folder'
+          ? await pickFolder()
+          : kind === 'save'
+            ? await pickSave({
+                filter: fileFilter,
+                initialName: saveName,
+                defaultExt: saveExt,
+                initialDir: saveDir,
+              })
+            : await pickFile(fileFilter ? { filter: fileFilter } : undefined);
       if (!result.cancelled && result.path) onChange(result.path);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -54,7 +97,12 @@ export const PathInput: React.FC<PathInputProps> = ({
     }
   };
 
-  const buttonLabel = kind === 'folder' ? `Browse for ${label} folder` : `Browse for ${label} file`;
+  const buttonLabel =
+    kind === 'folder'
+      ? `Browse for ${label} folder`
+      : kind === 'save'
+        ? `Choose where to save ${label}`
+        : `Browse for ${label} file`;
   // Inline implies the description lives in a hover tooltip rather than a
   // visible paragraph, so the field reclaims its horizontal/vertical space.
   const descAsHover = inline || descriptionHover;
@@ -78,12 +126,20 @@ export const PathInput: React.FC<PathInputProps> = ({
           title={hoverTitle}
           onChange={(e) => onChange(e.target.value)}
           onBlur={onBlur}
+          onFocus={onFocus}
+          onClick={onClick}
           onKeyDown={(e) => {
-            if (e.key === 'Enter') {
+            onKeyDown?.(e);
+            if (e.key === 'Enter' && !e.defaultPrevented) {
               if (onEnter) onEnter();
               else (e.target as HTMLInputElement).blur();
             }
           }}
+          role={role}
+          aria-expanded={ariaExpanded}
+          aria-controls={ariaControls}
+          aria-activedescendant={ariaActiveDescendant}
+          aria-autocomplete={ariaAutocomplete}
           disabled={disabled}
           spellCheck={false}
           placeholder={placeholder}
@@ -97,8 +153,8 @@ export const PathInput: React.FC<PathInputProps> = ({
           title={buttonLabel}
           className="shrink-0 inline-flex items-center justify-center gap-1.5 rounded border border-white/10 bg-white/5 px-2.5 py-1.5 text-[9px] font-black uppercase tracking-widest text-zinc-300 hover:border-purple-400/40 hover:bg-purple-500/15 hover:text-purple-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
         >
-          {picking ? <Loader2 className="w-3 h-3 animate-spin" /> : kind === 'folder' ? <FolderOpen className="w-3 h-3" /> : <FileSearch className="w-3 h-3" />}
-          Browse
+          {picking ? <Loader2 className="w-3 h-3 animate-spin" /> : kind === 'folder' ? <FolderOpen className="w-3 h-3" /> : kind === 'save' ? <Save className="w-3 h-3" /> : <FileSearch className="w-3 h-3" />}
+          {kind === 'save' ? 'Choose…' : 'Browse'}
         </button>
       </div>
       {description && !descAsHover && <p className="text-[8px] text-zinc-600 leading-relaxed">{description}</p>}

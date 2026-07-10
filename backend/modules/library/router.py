@@ -11,6 +11,7 @@ Endpoints (prefix from module.json → `/api/library`):
     DELETE /entries/{id}       remove the entry (audio + metadata)
     POST   /import             accept an audio upload, return new entry
     POST   /import-media       accept a video/image upload, return new entry
+    POST   /reindex            re-sync the SQLite mirror from the filesystem
 
 The audio stream uses FileResponse so range requests work (essential for
 the player to scrub) and there's no in-memory copy of large files.
@@ -65,6 +66,122 @@ def _attach_play_counts(store: LibraryStore, entries: list[dict[str, Any]]) -> N
         e["last_played_at"] = row.get("last_played_at")
 
 
+# Scalar analysis columns that are safe to expose on the entry verbatim. The
+# `*_json` columns (embedded_tags_json / ffprobe_json / semantic_tags_json) are
+# parsed separately below so the frontend never receives raw JSON strings.
+_ANALYSIS_SCALAR_KEYS = (
+    "bpm",
+    "key",
+    "key_confidence",
+    "scale",
+    "pitch_mean_hz",
+    "pitch_std_hz",
+    "loudness_lufs",
+    "rms_db",
+    "bars_estimated",
+    "genre",
+    "genre_confidence",
+    "prompt_guess",
+    "prompt_confidence",
+    "analyzed_at",
+)
+
+# Selected file-technical keys pulled out of the ffprobe `_summary` blob so the
+# inspector can show them as plain rows (sample rate, codec, …) without dumping
+# the whole ffprobe payload.
+_FFPROBE_SUMMARY_KEYS = (
+    "sample_rate",
+    "channels",
+    "bit_depth",
+    "codec",
+    "container",
+    "duration_sec",
+)
+
+
+def _loose_json(text: Optional[str]) -> Any:
+    """Tolerant JSON parse for the stored `*_json` analysis columns. Returns the
+    decoded value for objects/arrays, or ``None`` for empty/invalid input — so a
+    malformed column degrades to "absent" instead of raising mid-request."""
+    if not text:
+        return None
+    try:
+        value = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
+# WHY THIS ENRICHMENT EXISTS:
+# The frontend was built to read ``entry.analysis`` (the Catalogue inspector's
+# ANALYSIS section + library search by bpm/key/genre) and ``entry.embedded_tags``
+# (the EMBEDDED TAGS section), but the entry payload never carried them — so
+# those sections rendered empty and the stored analytics were effectively
+# invisible. The two helpers below light them up. Both are additive + defensive:
+# an entry with no analysis row is left exactly as-is.
+
+
+def _analysis_payload(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Turn one stored analysis row into the ``(analysis, embedded_tags)`` pair
+    the frontend consumes.
+
+    ``analysis`` is a FLAT scalar dict with NULL columns dropped (so the UI only
+    shows real data); ``embedded_tags`` is the parsed ID3/Vorbis/iTunes dict
+    (empty when the file carried none). The stored ``*_json`` columns are parsed
+    here so callers never receive raw JSON strings.
+    """
+    analysis: dict[str, Any] = {
+        k: row[k] for k in _ANALYSIS_SCALAR_KEYS if row.get(k) is not None
+    }
+    semantic = _loose_json(row.get("semantic_tags_json"))
+    if semantic:
+        analysis["semantic_tags"] = semantic
+    # File technicals live inside the ffprobe summary blob; surface a few.
+    summary = _loose_json(row.get("ffprobe_json")) or {}
+    summary = summary.get("_summary") if isinstance(summary, dict) else None
+    if isinstance(summary, dict):
+        for k in _FFPROBE_SUMMARY_KEYS:
+            if summary.get(k) is not None:
+                analysis.setdefault(k, summary[k])
+    embedded = _loose_json(row.get("embedded_tags_json"))
+    if not (isinstance(embedded, dict) and embedded):
+        embedded = {}
+    return analysis, embedded
+
+
+def _apply_analysis(entry: dict[str, Any], row: Optional[dict[str, Any]]) -> None:
+    """Merge one analysis ``row`` onto one ``entry`` dict in place. No-op when
+    ``row`` is ``None`` (entry not analyzed) or yields nothing renderable."""
+    if not row:
+        return
+    analysis, embedded = _analysis_payload(row)
+    if analysis:
+        entry["analysis"] = analysis
+    if embedded:
+        entry["embedded_tags"] = embedded
+
+
+def _attach_analysis(store: LibraryStore, entries: list[dict[str, Any]]) -> None:
+    """Bulk-enrich a LIST of entries with their analysis. One ``get_all_analysis``
+    query for the whole page (no N+1), then an in-memory join by id."""
+    if store.db is None:
+        return
+    rows = store.db.get_all_analysis()
+    if not rows:
+        return
+    for e in entries:
+        _apply_analysis(e, rows.get(e["id"]))
+
+
+def _attach_analysis_one(store: LibraryStore, entry: dict[str, Any]) -> None:
+    """Enrich a SINGLE entry via a targeted ``get_analysis(id)`` lookup — so a
+    single-entry GET never loads the entire analysis table (which the bulk
+    helper would). Used by the per-id endpoint that inspectors hit on select."""
+    if store.db is None:
+        return
+    _apply_analysis(entry, store.db.get_analysis(entry["id"]))
+
+
 _KIND_FILTERS: dict[str, Optional[set[str]]] = {
     "audio": {"audio"},
     "video": {"video"},
@@ -84,8 +201,9 @@ def list_entries(kind: str = "audio") -> dict[str, Any]:
             400, f"kind must be one of {sorted(_KIND_FILTERS)}, got {kind!r}"
         )
     store = get_store()
-    entries = [r.to_dict() for r in store.list_entries(kinds=_KIND_FILTERS[kind])]
+    entries = [r.to_dict() for r in store.list_entries_fast(kinds=_KIND_FILTERS[kind])]
     _attach_play_counts(store, entries)
+    _attach_analysis(store, entries)
     return {
         "entries": entries,
         "count": len(entries),
@@ -102,6 +220,7 @@ def get_entry(entry_id: str) -> dict[str, Any]:
         raise HTTPException(404, f"Entry {entry_id!r} not found")
     data = record.to_dict()
     _attach_play_counts(store, [data])
+    _attach_analysis_one(store, data)
     return data
 
 
@@ -159,22 +278,18 @@ def stream_stem_audio(stem_id: str) -> FileResponse:
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    # Stem rows are keyed per-entry, but stem ids are globally unique
-    # (`{entry_id}__{stem_name}`), so a linear scan is fine — small N
-    # and avoids needing a new DB index.
-    for entry in store.db.list_entries():
-        for stem in store.db.list_stems(entry["id"]):
-            if stem.get("id") == stem_id:
-                path = Path(stem.get("audio_path") or "")
-                if not path.is_file():
-                    raise HTTPException(404, f"stem file missing on disk: {path}")
-                mime, _ = mimetypes.guess_type(str(path))
-                return FileResponse(
-                    path=str(path),
-                    media_type=mime or "audio/wav",
-                    filename=path.name,
-                )
-    raise HTTPException(404, f"stem {stem_id!r} not found")
+    stem = store.db.get_stem(stem_id)
+    if stem is None:
+        raise HTTPException(404, f"stem {stem_id!r} not found")
+    path = Path(stem.get("audio_path") or "")
+    if not path.is_file():
+        raise HTTPException(404, f"stem file missing on disk: {path}")
+    mime, _ = mimetypes.guess_type(str(path))
+    return FileResponse(
+        path=str(path),
+        media_type=mime or "audio/wav",
+        filename=path.name,
+    )
 
 
 @router.patch("/stems/{stem_id}")
@@ -326,6 +441,18 @@ def import_folder(
     }
 
 
+@router.post("/reindex")
+def reindex_library() -> dict[str, Any]:
+    """Walk the on-disk library and upsert every entry into the SQLite mirror.
+    Heals entries added to data/generations outside the API (dropped in by
+    hand, synced from another machine, ...). store.reindex() is idempotent,
+    so repeated calls are safe."""
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    return {"reindexed": store.reindex()}
+
+
 @router.patch("/entries/{entry_id}")
 def update_entry(entry_id: str, patch: dict[str, Any] = Body(...)) -> dict[str, Any]:
     record = get_store().update_entry(entry_id, patch)
@@ -414,11 +541,18 @@ def download_bundle(entry_id: str) -> Response:
     analysis: Optional[dict[str, Any]] = None
     stems: list[dict[str, Any]] = []
     midis: list[dict[str, Any]] = []
+    scores: list[dict[str, Any]] = []
     edges: list[dict[str, Any]] = []
     if store.db is not None:
         analysis = store.db.get_analysis(entry_id)
         stems = store.db.list_stems(entry_id)
         midis = store.db.list_midis(entry_id)
+        # Notation artifacts minus raw midi (already bundled under midi/).
+        scores = [
+            a
+            for a in store.db.list_notation_artifacts(entry_id)
+            if a.get("kind") != "midi"
+        ]
         # Edges where entry is either parent or child.
         edges = store.db.list_relations(from_id=entry_id) + store.db.list_relations(
             to_id=entry_id
@@ -432,6 +566,7 @@ def download_bundle(entry_id: str) -> Response:
         analysis=analysis,
         stems=stems,
         midis=midis,
+        scores=scores,
         lineage_edges=edges,
     )
 
@@ -518,13 +653,7 @@ def list_all_stems() -> dict[str, Any]:
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    out: list[dict[str, Any]] = []
-    for entry in store.db.list_entries():
-        for stem in store.db.list_stems(entry["id"]):
-            stem_payload = dict(stem)
-            stem_payload["parent_title"] = entry.get("title")
-            stem_payload["parent_id"] = entry["id"]
-            out.append(stem_payload)
+    out = store.db.list_all_stems()
     return {"stems": out, "count": len(out)}
 
 
@@ -535,14 +664,24 @@ def list_all_midi() -> dict[str, Any]:
     store = get_store()
     if store.db is None:
         raise HTTPException(503, "library DB not available")
-    out: list[dict[str, Any]] = []
-    for entry in store.db.list_entries():
-        for midi in store.db.list_midis(entry["id"]):
-            midi_payload = dict(midi)
-            midi_payload["parent_title"] = entry.get("title")
-            midi_payload["parent_id"] = entry["id"]
-            out.append(midi_payload)
+    out = store.db.list_all_midis()
     return {"midis": out, "count": len(out)}
+
+
+@router.get("/_all/scores")
+def list_all_scores() -> dict[str, Any]:
+    """Return every notation/score artifact across every entry, joined to the
+    parent entry's title. Excludes raw ``midi`` artifacts (those live in the
+    MIDI tab); keeps sheets, tabs, arrangements, and exports."""
+    store = get_store()
+    if store.db is None:
+        raise HTTPException(503, "library DB not available")
+    out = [
+        art
+        for art in store.db.list_all_notation_artifacts()
+        if art.get("kind") != "midi"
+    ]
+    return {"scores": out, "count": len(out)}
 
 
 @router.get("/_graph/all")
@@ -569,19 +708,20 @@ def get_full_graph() -> dict[str, Any]:
             "source": r.get("source"),
             "duration_sec": r.get("duration_sec"),
             "model": r.get("model"),
+            # The genealogy/3D-graph header can highlight most-played nodes.
+            "play_count": int(r.get("play_count") or 0),
         }
         for r in raw_entries
     ]
     seen_ids = set(entries_by_id.keys())
 
     # Look up stems + midis once so we can label virtual nodes nicely.
-    all_stems: dict[str, dict[str, Any]] = {}
-    all_midis: dict[str, dict[str, Any]] = {}
-    for entry in raw_entries:
-        for s in store.db.list_stems(entry["id"]):
-            all_stems[s["id"]] = s
-        for m in store.db.list_midis(entry["id"]):
-            all_midis[m["id"]] = m
+    all_stems: dict[str, dict[str, Any]] = {
+        s["id"]: s for s in store.db.list_all_stems()
+    }
+    all_midis: dict[str, dict[str, Any]] = {
+        m["id"]: m for m in store.db.list_all_midis()
+    }
 
     for edge in raw_edges:
         for ref in (edge["from_id"], edge["to_id"]):

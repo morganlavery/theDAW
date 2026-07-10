@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { logError, logInfo } from './logStore';
 import type { PianoNote } from './pianoRollStore';
-import type { ChainEntry } from './effectChainStore';
+import type { ChainEntry, VstNode } from './effectChainStore';
 import { rackEffectDefaults } from '../lib/rackEffects';
 
 export type ToolMode = 'move' | 'cut' | 'split';
@@ -50,6 +50,10 @@ export interface AudioClip {
   fadeInSec?: number;
   /** Fade-out duration in seconds (0 = no fade). */
   fadeOutSec?: number;
+  /** Muted: the clip is skipped by playback and every offline bounce. This is
+   *  the ONE clip property liveMixer gates live mid-playback; all other clip
+   *  edits are structural and take effect on the next play. */
+  muted?: boolean;
 }
 
 export interface EditorTrack {
@@ -62,11 +66,19 @@ export interface EditorTrack {
   mute: boolean;
   solo: boolean;
   color: string;
+  /** Record-armed: target for mic/vocal recording. Shown as a red dot in the
+   *  track header. */
+  armed?: boolean;
   /** Default GM program (0-127) for MIDI clips on this track; undefined = global default. */
   instrumentProgram?: number;
   /** Per-track insert FX chain (real-time psychoacoustic rack), spliced between
    *  the track fader and its panner during live playback and offline bounce. */
   fxChain?: ChainEntry[];
+  /** Present while the track is FROZEN: its clips + insert chain are rendered to a
+   *  single printed stem (so backend-hosted VST3 — which can't run live in the
+   *  browser — becomes audible). The originals are stashed here for unfreeze; the
+   *  live fxChain is emptied because every effect is baked into the stem. */
+  frozenOriginal?: { clips: AudioClip[]; fxChain: ChainEntry[] };
 }
 
 /* ── Automation (Phase E) ─────────────────────────────────────────────────────
@@ -175,12 +187,32 @@ interface EditorStoreState {
   automationLanes: AutomationLane[];
   /** Write/arm mode: while on, moving an armed control during playback records. */
   automationWrite: boolean;
+  /** Master-bus VST3 chain (hosted via pedalboard). NOT a Web-Audio rack — these
+   *  apply when the master is rendered ("frozen"); see frozenMaster + previewMode. */
+  masterVstChain: ChainEntry[];
+  /** 'live' = play the realtime multitrack mix; 'frozen' = play the rendered
+   *  VST-processed master. Toggled from the Master VST panel. */
+  previewMode: 'live' | 'frozen';
+  /** The latest VST-rendered master plus the project signature it was rendered
+   *  from, so the UI can flag it stale after edits. Never persisted. */
+  frozenMaster: { blob: Blob; sig: string } | null;
 
   // Mutations
+  /** Replace the whole timeline with a loaded project (atomic; one fresh
+   *  document — undo history is reset). Used when opening a .tasmo. */
+  loadProject: (payload: { tracks: EditorTrack[]; clips: AudioClip[]; bpm?: number }) => void;
   addTrack: (overrides?: Partial<EditorTrack>) => string;
   removeTrack: (id: string) => void;
   updateTrack: (id: string, updates: Partial<EditorTrack>) => void;
   toggleSolo: (id: string) => void;
+  /** Freeze a track: replace its clips with one printed stem and empty its
+   *  fxChain (effects + VST baked in), stashing the originals for unfreeze. */
+  freezeTrack: (
+    trackId: string,
+    stem: { audioBlob: Blob; durationSec: number; peaks?: Float32Array },
+  ) => void;
+  /** Restore a frozen track's original clips + insert chain. */
+  unfreezeTrack: (trackId: string) => void;
 
   addClipToTrack: (clip: Omit<AudioClip, 'id'> & { id?: string }) => string;
   updateClip: (id: string, updates: Partial<AudioClip>) => void;
@@ -212,6 +244,13 @@ interface EditorStoreState {
   reorderTrackEffect: (trackId: string, from: number, to: number) => void;
   toggleTrackEffect: (trackId: string, entryId: string) => void;
   updateTrackEffectParams: (trackId: string, entryId: string, params: Record<string, number>) => void;
+  /** Store a VST entry's captured native-editor state on a track chain node,
+   *  so the dialed-in sound is applied at freeze/render time. */
+  setTrackVstRawState: (trackId: string, entryId: string, rawState: string) => void;
+  /** Replace an existing chain entry's effect with a live rack effect (reset to
+   *  its defaults, enabled), keeping the entry's id + slot. Used to "rebuild" an
+   *  imported device that came in inert so a controller mapping has a live home. */
+  rebuildTrackEffect: (trackId: string, entryId: string, effectId: string) => void;
 
   // Automation (Phase E)
   setAutomationWrite: (on: boolean) => void;
@@ -250,6 +289,16 @@ interface EditorStoreState {
   redo: () => void;
 
   // Selectors
+  addMasterVst: (plugin: VstNode) => void;
+  /** Store a VST entry's captured native-editor state on a master VST chain
+   *  node (staleness is caught by the freeze signature, which covers raw_state). */
+  setMasterVstRawState: (entryId: string, rawState: string) => void;
+  removeMasterVst: (entryId: string) => void;
+  reorderMasterVst: (from: number, to: number) => void;
+  clearMasterVst: () => void;
+  setPreviewMode: (mode: 'live' | 'frozen') => void;
+  setFrozenMaster: (frozen: { blob: Blob; sig: string } | null) => void;
+
   getTotalDurationSec: () => number;
   snapSec: (s: number) => number;
 }
@@ -304,6 +353,9 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   bpm: 120,
   inpaintSelection: null,
   masterFxChain: [],
+  masterVstChain: [],
+  previewMode: 'live',
+  frozenMaster: null,
   automationLanes: [],
   automationWrite: false,
   loopEnabled: false,
@@ -312,6 +364,37 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
   markers: [],
   _undo: [],
   _redo: [],
+
+  loadProject: ({ tracks, clips, bpm }) => {
+    const fallbackTrack: EditorTrack = {
+      id: 'track-1',
+      name: 'Track 1',
+      nameAutoGenerated: true,
+      volume: 0.8,
+      pan: 0,
+      mute: false,
+      solo: false,
+      color: DEFAULT_COLORS[0],
+    };
+    // Suppress undo recording for the bulk swap, then start the loaded project as
+    // a fresh document (empty undo/redo) so the user can't undo back into the
+    // previous session's tracks.
+    historyApplying = true;
+    set({
+      tracks: tracks.length ? tracks : [fallbackTrack],
+      clips,
+      selectedClipId: null,
+      playheadSec: 0,
+      scrollSec: 0,
+      isPlaying: false,
+      bpm: bpm && Number.isFinite(bpm) ? Math.max(40, Math.min(240, bpm)) : get().bpm,
+      _undo: [],
+      _redo: [],
+    });
+    historyApplying = false;
+    lastDocChangeAt = -Infinity;
+    logInfo('editor', `Loaded project: ${tracks.length} track(s), ${clips.length} clip(s)`);
+  },
 
   addTrack: (overrides) => {
     const id = `track-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
@@ -349,6 +432,55 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
     set((s) => ({
       tracks: s.tracks.map((t) => (t.id === id ? { ...t, ...updates } : t)),
     })),
+
+  freezeTrack: (trackId, stem) => {
+    set((s) => {
+      const track = s.tracks.find((t) => t.id === trackId);
+      if (!track) return {};
+      const original = s.clips.filter((c) => c.trackId === trackId);
+      const others = s.clips.filter((c) => c.trackId !== trackId);
+      const stemClip: AudioClip = {
+        id: uid(),
+        trackId,
+        label: `${track.name} (frozen)`,
+        audioBlob: stem.audioBlob,
+        mimeType: stem.audioBlob.type || 'audio/wav',
+        sourceDuration: stem.durationSec,
+        offsetIntoSource: 0,
+        durationSec: stem.durationSec,
+        startSec: 0,
+        color: track.color,
+        peaks: stem.peaks,
+      };
+      return {
+        clips: [...others, stemClip],
+        tracks: s.tracks.map((t) =>
+          t.id === trackId
+            ? { ...t, fxChain: [], frozenOriginal: { clips: original, fxChain: t.fxChain ?? [] } }
+            : t,
+        ),
+        selectedClipId: null,
+      };
+    });
+    logInfo('editor', `Froze track ${trackId}: printed FX into a stem`);
+  },
+
+  unfreezeTrack: (trackId) => {
+    set((s) => {
+      const track = s.tracks.find((t) => t.id === trackId);
+      if (!track || !track.frozenOriginal) return {};
+      const fo = track.frozenOriginal;
+      const others = s.clips.filter((c) => c.trackId !== trackId);
+      return {
+        clips: [...others, ...fo.clips],
+        tracks: s.tracks.map((t) =>
+          t.id === trackId ? { ...t, fxChain: fo.fxChain, frozenOriginal: undefined } : t,
+        ),
+        selectedClipId: null,
+      };
+    });
+    logInfo('editor', `Unfroze track ${trackId}: restored clips + FX`);
+  },
 
   toggleSolo: (id) => {
     const target = get().tracks.find((t) => t.id === id);
@@ -478,6 +610,46 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       masterFxChain: s.masterFxChain.map((e) => (e.id === entryId ? { ...e, params } : e)),
     })),
 
+  // --- Master VST3 chain (rendered/frozen, not live Web-Audio) ---
+  addMasterVst: (plugin) =>
+    set((s) => ({
+      masterVstChain: [
+        ...s.masterVstChain,
+        { id: uid(), effect: 'vst3', params: {}, enabled: true, vst: plugin },
+      ],
+      frozenMaster: null,
+    })),
+
+  setMasterVstRawState: (entryId, rawState) =>
+    set((s) => ({
+      masterVstChain: s.masterVstChain.map((e) =>
+        e.id === entryId && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
+      ),
+    })),
+
+  removeMasterVst: (entryId) =>
+    set((s) => ({
+      masterVstChain: s.masterVstChain.filter((e) => e.id !== entryId),
+      frozenMaster: null,
+    })),
+
+  reorderMasterVst: (from, to) =>
+    set((s) => {
+      if (from === to || from < 0 || to < 0 || from >= s.masterVstChain.length || to >= s.masterVstChain.length) {
+        return {};
+      }
+      const next = [...s.masterVstChain];
+      const [item] = next.splice(from, 1);
+      next.splice(to, 0, item);
+      return { masterVstChain: next, frozenMaster: null };
+    }),
+
+  clearMasterVst: () => set({ masterVstChain: [], frozenMaster: null, previewMode: 'live' }),
+
+  setPreviewMode: (mode) => set({ previewMode: mode }),
+
+  setFrozenMaster: (frozen) => set({ frozenMaster: frozen }),
+
   addTrackEffect: (trackId, effectId) =>
     set((s) => ({
       tracks: s.tracks.map((t) =>
@@ -522,6 +694,38 @@ export const useEditorStore = create<EditorStoreState>()((set, get) => ({
       tracks: s.tracks.map((t) =>
         t.id === trackId
           ? { ...t, fxChain: (t.fxChain ?? []).map((e) => (e.id === entryId ? { ...e, params } : e)) }
+          : t,
+      ),
+    })),
+
+  setTrackVstRawState: (trackId, entryId, rawState) =>
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === trackId
+          ? {
+              ...t,
+              fxChain: (t.fxChain ?? []).map((e) =>
+                e.id === entryId && e.vst ? { ...e, vst: { ...e.vst, raw_state: rawState } } : e,
+              ),
+            }
+          : t,
+      ),
+    })),
+
+  rebuildTrackEffect: (trackId, entryId, effectId) =>
+    set((s) => ({
+      tracks: s.tracks.map((t) =>
+        t.id === trackId
+          ? {
+              ...t,
+              // Keep the entry's id + original label (so the source device name
+              // still shows), but make it a live rack effect at its defaults.
+              fxChain: (t.fxChain ?? []).map((e) =>
+                e.id === entryId
+                  ? { ...e, effect: effectId, params: rackEffectDefaults(effectId), enabled: true, vst: undefined }
+                  : e,
+              ),
+            }
           : t,
       ),
     })),

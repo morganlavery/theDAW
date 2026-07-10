@@ -1,5 +1,9 @@
 import React, { Suspense, lazy, useEffect, useState } from 'react';
 import { useAppUiStore } from '../../state/appUiStore';
+import { TabErrorBoundary } from './TabErrorBoundary';
+// Session tab is eager (not code-split): keeps it robust against lazy-chunk
+// load failures and it is light (an Ableton session grid over existing stores).
+import { SessionView } from '../../views/SessionView';
 
 /**
  * The center workspace — CenterTabBar at the top + the active tab's
@@ -28,10 +32,13 @@ import { useAppUiStore } from '../../state/appUiStore';
 const WaveformEditor = lazy(() => import('../audio/WaveformEditor').then((m) => ({ default: m.WaveformEditor })));
 const AdvancedView = lazy(() => import('../../views/AdvancedView').then((m) => ({ default: m.AdvancedView })));
 const MixView = lazy(() => import('../../views/MixView').then((m) => ({ default: m.MixView })));
-const TrainView = lazy(() => import('../../views/TrainView').then((m) => ({ default: m.TrainView })));
 const LineageView = lazy(() => import('../library/LineageModal').then((m) => ({ default: m.LineageView })));
 const VJView = lazy(() => import('../../views/VJView').then((m) => ({ default: m.VJView })));
 const DJView = lazy(() => import('../../views/DJView').then((m) => ({ default: m.DJView })));
+const FoundryView = lazy(() => import('../../views/FoundryView').then((m) => ({ default: m.FoundryView })));
+const UnderfitView = lazy(() => import('../../views/UnderfitView').then((m) => ({ default: m.UnderfitView })));
+const AudimateView = lazy(() => import('../../views/AudimateView').then((m) => ({ default: m.AudimateView })));
+const TourView = lazy(() => import('../../views/TourView').then((m) => ({ default: m.TourView })));
 
 const TabFallback: React.FC = () => (
   <div className="absolute inset-0 grid place-items-center">
@@ -43,12 +50,13 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
   const centerTab = useAppUiStore((s) => s.centerTab);
 
   // Track which heavy live-performance tabs have been opened at least
-  // once. We only mount DJ / VJ after first visit (so a user who never
-  // touches them pays nothing), then keep them mounted permanently and
-  // toggle visibility — preserving deck state + the warm VJ iframe.
+  // once. We only mount DJ / VJ / LEARN after first visit (so a user who
+  // never touches them pays nothing), then keep them mounted permanently
+  // and toggle visibility — preserving deck state, the warm VJ iframe,
+  // and the LEARN genealogy graph's fetch + layout + pan/zoom.
   const [warmedTabs, setWarmedTabs] = useState<Set<string>>(() => new Set());
   useEffect(() => {
-    if (centerTab === 'dj' || centerTab === 'vj') {
+    if (centerTab === 'dj' || centerTab === 'vj' || centerTab === 'foundry' || centerTab === 'underfit' || centerTab === 'audimate' || centerTab === 'learn' || centerTab === 'tour') {
       setWarmedTabs((prev) => {
         if (prev.has(centerTab)) return prev;
         const next = new Set(prev);
@@ -66,11 +74,6 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           in Shell.tsx, no longer inside this card. */}
       <div className="flex-1 min-h-0 hardware-card flex flex-col mx-2 pt-1">
         <div className="flex-1 min-h-0 relative">
-          {centerTab === 'train' && (
-            <div className="absolute inset-0 overflow-hidden">
-              <Suspense fallback={<TabFallback />}><TrainView /></Suspense>
-            </div>
-          )}
           {centerTab === 'make' && (
             <div className="absolute inset-0 overflow-hidden">
               <Suspense fallback={<TabFallback />}><AdvancedView /></Suspense>
@@ -78,6 +81,11 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
           )}
           {centerTab === 'edit' && (
             <Suspense fallback={<TabFallback />}><WaveformEditor onSwitchTab={onSwitchTab} /></Suspense>
+          )}
+          {centerTab === 'session' && (
+            <div className="absolute inset-0 overflow-hidden">
+              <TabErrorBoundary tabName="Perform"><SessionView /></TabErrorBoundary>
+            </div>
           )}
           {centerTab === 'mix' && (
             // PROCESS → MIX. The MIX workspace on the Control-Surface editor
@@ -89,8 +97,19 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               <Suspense fallback={<TabFallback />}><MixView /></Suspense>
             </div>
           )}
-          {centerTab === 'learn' && (
-            <Suspense fallback={<TabFallback />}><LineageView rootEntryId={null} /></Suspense>
+          {/* LEARN stays mounted once warmed (same pattern as DJ/VJ below)
+              so tab switches preserve the fetched graph, the computed
+              layout, the DOM, and the user's pan/zoom. The `visible` prop
+              tells the view when it is re-shown so it can refetch the
+              cheap bulk graph endpoint and rebuild only if the library
+              actually changed. */}
+          {warmedTabs.has('learn') && (
+            <div
+              className="absolute inset-0"
+              style={{ display: centerTab === 'learn' ? undefined : 'none' }}
+            >
+              <Suspense fallback={<TabFallback />}><LineageView rootEntryId={null} visible={centerTab === 'learn'} /></Suspense>
+            </div>
           )}
 
           {/* DJ + VJ stay mounted once warmed; visibility toggles with
@@ -111,6 +130,38 @@ export const DAWCenterPanel: React.FC<{ onSwitchTab?: (tab: string) => void }> =
               style={{ display: centerTab === 'vj' ? undefined : 'none' }}
             >
               <Suspense fallback={<TabFallback />}><VJView /></Suspense>
+            </div>
+          )}
+          {warmedTabs.has('foundry') && (
+            <div
+              className="absolute inset-0"
+              style={{ display: centerTab === 'foundry' ? undefined : 'none' }}
+            >
+              <Suspense fallback={<TabFallback />}><FoundryView /></Suspense>
+            </div>
+          )}
+          {warmedTabs.has('underfit') && (
+            <div
+              className="absolute inset-0"
+              style={{ display: centerTab === 'underfit' ? undefined : 'none' }}
+            >
+              <Suspense fallback={<TabFallback />}><UnderfitView /></Suspense>
+            </div>
+          )}
+          {warmedTabs.has('audimate') && (
+            <div
+              className="absolute inset-0"
+              style={{ display: centerTab === 'audimate' ? undefined : 'none' }}
+            >
+              <Suspense fallback={<TabFallback />}><AudimateView /></Suspense>
+            </div>
+          )}
+          {warmedTabs.has('tour') && (
+            <div
+              className="absolute inset-0"
+              style={{ display: centerTab === 'tour' ? undefined : 'none' }}
+            >
+              <Suspense fallback={<TabFallback />}><TourView /></Suspense>
             </div>
           )}
         </div>

@@ -17,6 +17,7 @@ Wire format on the TCP socket (matches QuestMidiSender / the Node bridge):
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import subprocess
@@ -27,6 +28,11 @@ from backend.core.adb import resolve_adb_path
 log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 8765
+# The backend's own HTTP port, reversed alongside the MIDI port so a
+# USB-tethered headset reaches the whole API — including the XR control-bus
+# relay at ws://127.0.0.1:8600/api/xr/control/ws — on its own loopback with
+# zero network setup, exactly like MIDI.
+DEFAULT_HTTP_PORT = 8600
 ClientSend = Callable[[list[int]], Awaitable[None]]
 
 
@@ -35,6 +41,13 @@ def _port() -> int:
         return int(os.getenv("theDAW_QUESTMIDI_PORT") or DEFAULT_PORT)
     except ValueError:
         return DEFAULT_PORT
+
+
+def _http_port() -> int:
+    try:
+        return int(os.getenv("theDAW_PORT") or DEFAULT_HTTP_PORT)
+    except ValueError:
+        return DEFAULT_HTTP_PORT
 
 
 def _adb_path() -> Optional[str]:
@@ -52,6 +65,7 @@ class _State:
     adb_reverse_ok: bool = False
     started: bool = False
     starting: bool = False
+    port_in_use: bool = False
 
 
 _s = _State()
@@ -155,16 +169,19 @@ def _run_adb_reverse(port: int) -> bool:
             check=True,
         )
         return True
-    except Exception as e:  # noqa: BLE001
-        log.info("questmidi: adb reverse failed: %s", e)
+    except Exception as e:  # noqa: BLE001 — expected when no headset is plugged in
+        log.debug("questmidi: adb reverse failed: %s", e)
         return False
 
 
 async def reattach_adb() -> bool:
     """Re-run ``adb reverse`` (after re-plugging the headset / accepting the
-    USB-debugging prompt) without restarting the listener."""
+    USB-debugging prompt) without restarting the listener. Reverses the MIDI
+    port AND the backend HTTP port (control-bus relay) in one pass; only the
+    MIDI port decides the reported ok state, matching what this bridge owns."""
     loop = asyncio.get_running_loop()
     _s.adb_reverse_ok = await loop.run_in_executor(None, _run_adb_reverse, _port())
+    await loop.run_in_executor(None, _run_adb_reverse, _http_port())
     return _s.adb_reverse_ok
 
 
@@ -176,8 +193,26 @@ async def ensure_started() -> None:
     try:
         port = _port()
         await reattach_adb()
-        _s.server = await asyncio.start_server(_handle_quest, "127.0.0.1", port)
+        try:
+            _s.server = await asyncio.start_server(_handle_quest, "127.0.0.1", port)
+        except OSError as e:
+            # EADDRINUSE (WSAEADDRINUSE 10048 on Windows): the port is already
+            # bound — almost always a second theDAW instance or a --reload
+            # leftover that still owns the listener. Treat it as started so we
+            # don't re-attempt the bind (and re-log) on every WebSocket connect;
+            # the existing listener relays the headset.
+            if e.errno in (errno.EADDRINUSE, 10048):
+                _s.started = True
+                _s.port_in_use = True
+                log.info(
+                    "questmidi: port %d already in use — an existing bridge "
+                    "owns it; not starting a second listener",
+                    port,
+                )
+                return
+            raise
         _s.started = True
+        _s.port_in_use = False
         log.info(
             "questmidi: listening on 127.0.0.1:%d (adb reverse %s)",
             port,
@@ -211,6 +246,7 @@ def status() -> dict:
     return {
         "started": _s.started,
         "port": _port(),
+        "port_in_use": _s.port_in_use,
         "adb_path": _adb_path(),
         "adb_reverse_ok": _s.adb_reverse_ok,
         "quest_connected": _s.quest_writer is not None,

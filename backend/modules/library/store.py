@@ -223,6 +223,33 @@ def _resolve_audio_file(entry_dir: Path, meta: dict[str, Any]) -> Optional[Path]
     return None
 
 
+def _flatten_suno_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """Suno API-compatible format normalization: if metadata came from a Suno
+    External API cache (has an "inferred" dict), flatten inferred fields to
+    top-level so downstream field reads work. No-op on normal theDAW metadata
+    (no "inferred" key exists). Shallow-copies before mutating so the caller's
+    dict keeps DB fidelity."""
+    inferred = meta.get("inferred")
+    if not isinstance(inferred, dict):
+        return meta
+    meta = dict(meta)
+    for k, v in inferred.items():
+        if meta.get(k) is None:
+            meta[k] = v
+
+    # Pull nested Suno API metadata.metadata fields up to top-level.
+    # Only runs when "inferred" was present (Suno format marker).
+    api_meta = meta.get("metadata")
+    if isinstance(api_meta, dict):
+        if api_meta.get("lyrics") and not meta.get("lyrics"):
+            meta["lyrics"] = api_meta["lyrics"]
+        if api_meta.get("style") and not meta.get("style"):
+            meta["style"] = api_meta["style"]
+        if api_meta.get("description") and not meta.get("prompt"):
+            meta["prompt"] = api_meta["description"]
+    return meta
+
+
 def _record_from_metadata(
     entry_dir: Path,
     meta: dict[str, Any],
@@ -230,28 +257,7 @@ def _record_from_metadata(
 ) -> Optional[LibraryRecord]:
     """Build a LibraryRecord from a metadata.json payload. Returns None if
     the directory has no resolvable audio file AND no CDN URL fallback."""
-    # ── Suno API-compatible format normalization ─────────────────────
-    # If metadata came from a Suno External API cache (has "inferred" dict),
-    # flatten inferred fields to top-level so downstream field reads work.
-    # No-op on normal theDAW metadata (no "inferred" key exists).
-    # Shallow-copy to avoid mutating the caller's dict (preserves DB fidelity).
-    inferred = meta.get("inferred")
-    if isinstance(inferred, dict):
-        meta = dict(meta)
-        for k, v in inferred.items():
-            if meta.get(k) is None:
-                meta[k] = v
-
-        # Pull nested Suno API metadata.metadata fields up to top-level.
-        # Only runs when "inferred" was present (Suno format marker).
-        api_meta = meta.get("metadata")
-        if isinstance(api_meta, dict):
-            if api_meta.get("lyrics") and not meta.get("lyrics"):
-                meta["lyrics"] = api_meta["lyrics"]
-            if api_meta.get("style") and not meta.get("style"):
-                meta["style"] = api_meta["style"]
-            if api_meta.get("description") and not meta.get("prompt"):
-                meta["prompt"] = api_meta["description"]
+    meta = _flatten_suno_meta(meta)
 
     entry_id = entry_dir.name
 
@@ -495,6 +501,95 @@ class LibraryStore:
                 out.append(record)
         return out
 
+    def list_entries_fast(
+        self, kinds: Optional[Iterable[str]] = None
+    ) -> list[LibraryRecord]:
+        """DB-backed sibling of :meth:`list_entries` for the hot ``/entries``
+        endpoint: ONE ``entries`` SELECT plus one directory stat per row,
+        instead of reading and JSON-parsing every ``metadata.json`` off disk.
+        Falls back to the filesystem walk when the DB is disabled. Sizes and
+        timestamps come from the DB snapshot, so a file changed behind the
+        store's back stays stale until :meth:`reindex`."""
+        if self.db is None:
+            return self.list_entries(kinds)
+        kind_set = set(kinds) if kinds is not None else None
+        out: list[LibraryRecord] = []
+        for row in self.db.list_entries():
+            entry_id = str(row["id"])
+            kind = str(row.get("kind") or "audio")
+            if kind_set is not None and kind not in kind_set:
+                continue
+            # The walk hides entries whose folder was deleted by hand;
+            # _dir_for preserves that with a stat instead of a metadata read
+            # (it also resolves the nested "<job_id>/<index>" generate layout
+            # that a plain root/<id> check would miss).
+            entry_dir = self._dir_for(entry_id)
+            if entry_dir is None:
+                continue
+            try:
+                meta = json.loads(row.get("metadata_json") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            meta = _flatten_suno_meta(meta)
+            is_media = kind in ("video", "image")
+            if is_media:
+                media_url: Optional[str] = _media_url_for(self.api_prefix, entry_id)
+                audio_url = media_url
+                thumb_url = (
+                    _thumb_url_for(self.api_prefix, entry_id)
+                    if (entry_dir / "thumb.jpg").is_file()
+                    else None
+                )
+            else:
+                media_url = None
+                audio_url = _audio_url_for(self.api_prefix, entry_id)
+                thumb_url = None
+            # mime_type must come from metadata, not the DB mime column:
+            # upsert_entry coerces an empty mime to 'audio/wav', which would
+            # break the walk's '' default for media and 'audio/mpeg' for audio.
+            mime_default = "" if is_media else "audio/mpeg"
+            out.append(
+                LibraryRecord(
+                    id=entry_id,
+                    title=str(row.get("title") or ""),
+                    prompt=str(row.get("prompt") or ""),
+                    negative_prompt=str(row.get("negative_prompt") or ""),
+                    model=str(row.get("model") or ""),
+                    duration=float(row.get("duration_sec") or 0.0),
+                    steps=int(row.get("steps") or 0),
+                    cfg=float(row.get("cfg") or 0.0),
+                    seed=int(row.get("seed") or 0),
+                    audio_url=audio_url,
+                    audio_filename=str(row.get("audio_filename") or ""),
+                    mime_type=str(meta.get("mime_type") or mime_default),
+                    file_size_bytes=int(row.get("file_size_bytes") or 0),
+                    timestamp=str(row.get("timestamp") or ""),
+                    favorite=bool(row.get("favorite")),
+                    rating=None if is_media else row.get("rating"),
+                    tags=list(meta.get("tags") or []),
+                    notes=str(row.get("notes") or ""),
+                    source=str(row.get("source") or "generate"),
+                    chimera_sources=[]
+                    if is_media
+                    else list(meta.get("chimera_sources") or []),
+                    spectrogram_paths={}
+                    if is_media
+                    else dict(meta.get("spectrogram_paths") or {}),
+                    kind=kind,
+                    media_url=media_url,
+                    thumb_url=thumb_url,
+                    width=_int_or_none(meta.get("width")) if is_media else None,
+                    height=_int_or_none(meta.get("height")) if is_media else None,
+                    has_alpha=bool(meta.get("has_alpha", False)) if is_media else False,
+                )
+            )
+        # The walk emits entries in sorted(root.iterdir()) order; sorting by
+        # id mirrors that (entry ids are the directory names).
+        out.sort(key=lambda r: r.id)
+        return out
+
     def get_entry(self, entry_id: str) -> Optional[LibraryRecord]:
         entry_dir = self._dir_for(entry_id)
         if entry_dir is None:
@@ -567,6 +662,14 @@ class LibraryStore:
         record = self.get_entry(entry_id)
         if record is not None:
             self._sync_record_to_db(record, meta)
+        # Favoriting a track gives it the full treatment — stems, MIDI, and a
+        # score — so a starred track is always fully analyzed and notated. Each
+        # job is idempotent (skipped if the artifact exists) and runs on the
+        # idle-gated, serialized background queue (stems -> midi -> score).
+        if bool(patch.get("favorite")):
+            _maybe_enqueue_stems(self, entry_id, source="favorite", force=True)
+            _maybe_enqueue_midi(self, entry_id, source="favorite", force=True)
+            _maybe_enqueue_score(self, entry_id, source="favorite", force=True)
         return record
 
     def delete_entry(self, entry_id: str) -> bool:
@@ -649,6 +752,7 @@ class LibraryStore:
         _maybe_enqueue_analysis(self, entry_id, source="import")
         _maybe_enqueue_stems(self, entry_id, source="import")
         _maybe_enqueue_midi(self, entry_id, source="import")
+        _maybe_enqueue_score(self, entry_id, source="import")
         return record
 
     def register_reference(
@@ -929,10 +1033,13 @@ def _maybe_enqueue_stems(
     entry_id: str,
     *,
     source: str,
+    force: bool = False,
 ) -> None:
     """If feature settings have ``stems.auto_on_<source>`` enabled, queue
     a background stem-separation job. Heavy work — relies on the
-    integration-package sidecar."""
+    integration-package sidecar. ``force`` bypasses the settings gate (used
+    when favoriting a track), but the job is still skipped when the entry
+    already has stems."""
     if store.db is None:
         return
     try:
@@ -944,11 +1051,18 @@ def _maybe_enqueue_stems(
     try:
         settings = get_settings_store().get_section("stems")
     except Exception:
-        return
+        settings = {}
 
     key = f"auto_on_{source}"
-    if not settings.get(key, False):
+    if not force and not settings.get(key, False):
         return
+
+    # Idempotent: never re-separate an entry that already has stems.
+    try:
+        if store.db.list_stems(entry_id):
+            return
+    except Exception:
+        pass
 
     audio_path = store.get_audio_path(entry_id)
     entry_dir = store._dir_for(entry_id)
@@ -979,10 +1093,13 @@ def _maybe_enqueue_midi(
     entry_id: str,
     *,
     source: str,
+    force: bool = False,
 ) -> None:
     """If feature settings have ``midi.auto_on_<source>`` enabled, queue
     a background MIDI-conversion job. Reads ``midi.from_stems`` to
-    decide whether to also convert each stem."""
+    decide whether to also convert each stem. ``force`` bypasses the settings
+    gate (used when favoriting), but the job is still skipped when the entry
+    already has MIDI."""
     if store.db is None:
         return
     try:
@@ -994,11 +1111,18 @@ def _maybe_enqueue_midi(
     try:
         settings = get_settings_store().get_section("midi")
     except Exception:
-        return
+        settings = {}
 
     key = f"auto_on_{source}"
-    if not settings.get(key, False):
+    if not force and not settings.get(key, False):
         return
+
+    # Idempotent: never re-transcribe an entry that already has MIDI.
+    try:
+        if store.db.list_midis(entry_id):
+            return
+    except Exception:
+        pass
 
     audio_path = store.get_audio_path(entry_id)
     entry_dir = store._dir_for(entry_id)
@@ -1028,3 +1152,90 @@ def _maybe_enqueue_midi(
         get_background_queue().enqueue(f"midi:{entry_id}", _run)
     except Exception as e:
         log.debug("library.store: failed to enqueue midi for %s: %s", entry_id, e)
+
+
+def _generate_score_for_entry(
+    store: "LibraryStore", entry_id: str, entry_dir: Path
+) -> None:
+    """Generate a MusicXML sheet from the entry's first MIDI, stamped with the
+    song title. No-op if the entry already has a sheet or has no MIDI. Runs in
+    a worker thread (music21 parse is CPU-bound)."""
+    if store.db is None:
+        return
+    try:
+        from backend.modules.notation.engine import (
+            midi_to_musicxml,
+            register_existing_midis,
+        )
+    except Exception:
+        return
+    try:
+        register_existing_midis(store.db, entry_id)
+        if store.db.list_notation_artifacts(entry_id, kind="musicxml"):
+            return  # already scored
+        target = None
+        for midi in store.db.list_midis(entry_id):
+            path = midi.get("midi_path") or ""
+            if path and Path(path).is_file():
+                target = midi
+                break
+        if target is None:
+            return  # nothing to score
+        record = store.get_entry(entry_id)
+        title = str(getattr(record, "title", "") or "")
+        midi_id = str(target.get("id") or "")
+        output = entry_dir / "notation" / f"{midi_id}.musicxml"
+        midi_to_musicxml(
+            store.db,
+            entry_id=entry_id,
+            midi_path=Path(target["midi_path"]),
+            output_path=output,
+            source_ref=midi_id,
+            artifact_id=f"{midi_id}__musicxml",
+            title=title,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort background work
+        log.debug("library.store: auto-score failed for %s: %s", entry_id, e)
+
+
+def _maybe_enqueue_score(
+    store: "LibraryStore",
+    entry_id: str,
+    *,
+    source: str,
+    force: bool = False,
+) -> None:
+    """Queue a background job that turns the entry's MIDI into a titled sheet.
+    Auto-score defaults ON (sheets are cheap music21 work and the job only acts
+    when a MIDI already exists and no sheet does). ``force`` bypasses the
+    settings gate (used when favoriting). Enqueued AFTER any MIDI job so the
+    serial idle queue runs MIDI first, then this finds its output."""
+    if store.db is None:
+        return
+    try:
+        from backend.core.background_workers import get_background_queue
+        from backend.modules.settings.router import get_store as get_settings_store
+    except ImportError:
+        return
+
+    if not force:
+        try:
+            settings = get_settings_store().get_section("notation")
+        except Exception:
+            settings = {}
+        if not settings.get(f"auto_on_{source}", True):
+            return
+
+    entry_dir = store._dir_for(entry_id)
+    if entry_dir is None:
+        return
+
+    async def _run() -> None:
+        import asyncio
+
+        await asyncio.to_thread(_generate_score_for_entry, store, entry_id, entry_dir)
+
+    try:
+        get_background_queue().enqueue(f"score:{entry_id}", _run)
+    except Exception as e:
+        log.debug("library.store: failed to enqueue score for %s: %s", entry_id, e)

@@ -64,6 +64,33 @@
     display: none;                  /* Chromium/WebKit */
   }
 
+  /* Always-visible scrollbar for the LOG (and anywhere legibility beats
+     minimalism). Hardcoded colors so it reads on ANY theme — the global 5px
+     bg-white/5 thumb vanishes on both dark and light surfaces. */
+  .log-scroll {
+    scrollbar-width: thin;                                    /* Firefox */
+    scrollbar-color: rgba(139, 92, 246, 0.75) rgba(120, 120, 140, 0.18);
+    scrollbar-gutter: stable;
+  }
+  .log-scroll::-webkit-scrollbar {
+    width: 10px;
+  }
+  .log-scroll::-webkit-scrollbar-track {
+    background: rgba(120, 120, 140, 0.18);
+    border-radius: 6px;
+  }
+  .log-scroll::-webkit-scrollbar-thumb {
+    background: rgba(139, 92, 246, 0.75);
+    border-radius: 6px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+    min-height: 32px;
+  }
+  .log-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(139, 92, 246, 0.95);
+    background-clip: padding-box;
+  }
+
   /* Fluid zoom for high-density - adjusts based on viewport height/width.
      --layout-zoom mirrors the zoom factor so `calc(... / var(--layout-zoom))`
      can pre-compensate for the rendering scale (e.g. so a child sized to fill
@@ -115,6 +142,24 @@
   .btn-ghost {
     @apply bg-white/5 hover:bg-white/10 text-zinc-300 border border-white/5 py-1 px-2 rounded text-[10px] transition-all;
   }
+
+  /* High-contrast <select> matching .compact-input. Carries no padding /
+     text-size so it composes with each control's own sizing classes
+     (px/py/text-*). color-scheme keeps the native option popup dark. */
+  .form-select {
+    @apply bg-black/40 border border-(--panel-border) rounded text-white outline-none focus:border-purple-500 cursor-pointer transition-colors;
+    color-scheme: dark;
+  }
+}
+
+/* Native <select> popups render dark + legible everywhere (the browser
+   default is a white option list that clashes with theDAW's dark panels);
+   option rows take the panel palette so the open list matches the app. */
+select { color-scheme: dark; }
+select option,
+select optgroup {
+  background-color: var(--panel);
+  color: var(--text-primary);
 }
 
 @theme {
@@ -167,3 +212,139 @@
 .text-xs,   .text-xs\!   { font-size: calc(0.75rem  * var(--text-scale, 1)) !important; }
 .text-sm,   .text-sm\!   { font-size: calc(0.875rem * var(--text-scale, 1)) !important; }
 .text-base, .text-base\! { font-size: calc(1rem     * var(--text-scale, 1)) !important; }
+
+/* ---------------------------------------------------------------------------
+ * Genealogy graph hover glow (LineageModal's GenealogyView).
+ * The classes + the --glow custom property are toggled imperatively via
+ * classList so React never re-renders the mounted SVG while the mouse moves.
+ * Deliberately NO transitions on any of these rules: transitioned filters on
+ * hundreds of SVG groups forced a repaint storm; glow must apply and clear in
+ * a single frame.
+ * Node cards are small (140x140) so their drop-shadow filter surfaces stay
+ * cheap. Edges must NOT use drop-shadow: a bezier edge's <g> bounding box can
+ * span thousands of px, and the oversized filter surface makes Chromium drop
+ * or checkerboard the layer (edges visibly flash out of existence). Lit edges
+ * therefore glow via full opacity + a 3x stroke instead.
+ * ------------------------------------------------------------------------- */
+.genealogy-svg.gen-hovering g[data-node-id]:not(.gen-lit) { opacity: 0.35; }
+.genealogy-svg.gen-hovering g[data-edge-from]:not(.gen-lit) { opacity: 0.12; }
+.genealogy-svg g.gen-lit[data-node-id] { filter: drop-shadow(0 0 14px var(--glow)) brightness(1.3); }
+.genealogy-svg g.gen-lit-hot[data-node-id] { filter: drop-shadow(0 0 26px var(--glow)) drop-shadow(0 0 10px var(--glow)) brightness(1.6) saturate(1.35); }
+.genealogy-svg g.gen-lit-hot[data-node-id] > rect:first-of-type { stroke-width: 4; }
+.genealogy-svg g.gen-lit[data-edge-from] { opacity: 1; }
+.genealogy-svg g.gen-lit[data-edge-from] path { stroke-width: 4.5; }
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * APP THEMING.
+ * The Shell root carries `.edit-theme-scope` and inline `--et-*` variables (see
+ * lib/editThemes.ts + state/editThemeStore.ts), so the theme applies across the
+ * whole app (every tab + chrome). These UNLAYERED rules remap the neutral
+ * chrome — every black-opacity surface, white-opacity fill, and white/hex
+ * border — onto those variables. Unlayered beats Tailwind's utilities layer, so
+ * no per-element class edits are needed; the default "Midnight" variables
+ * reproduce the original palette exactly, so an un-themed app is pixel-identical.
+ * Semantic accents (purple/red/amber/…) are intentionally NOT remapped. Modals
+ * portaled to <body> sit outside the scope and keep the default dark chrome.
+ * ─────────────────────────────────────────────────────────────────────────── */
+.edit-theme-scope {
+  background: var(--et-root-bg);
+  /* Drive the app design tokens so every hardware-card and token-built box
+     (MAKE / MIX / chrome) re-themes, not only the hardcoded-utility surfaces. */
+  --bg: var(--et-canvas);
+  --panel: var(--et-panel);
+  --panel-border: var(--et-line-hex);
+}
+
+/* Black-opacity surface fills → themed shade (one base preserves the hierarchy). */
+.edit-theme-scope .bg-black\/20 { background-color: rgb(var(--et-shade) / 0.20); }
+.edit-theme-scope .bg-black\/30 { background-color: rgb(var(--et-shade) / 0.30); }
+.edit-theme-scope .bg-black\/40 { background-color: rgb(var(--et-shade) / 0.40); }
+.edit-theme-scope .bg-black\/50 { background-color: rgb(var(--et-shade) / 0.50); }
+.edit-theme-scope .bg-black\/60 { background-color: rgb(var(--et-shade) / 0.60); }
+.edit-theme-scope .bg-black\/80 { background-color: rgb(var(--et-shade) / 0.80); }
+.edit-theme-scope .bg-black\/90 { background-color: rgb(var(--et-shade) / 0.90); }
+.edit-theme-scope .bg-black\/95 { background-color: rgb(var(--et-shade) / 0.95); }
+
+/* Solid hex + neutral (zinc/slate) surfaces across the whole app, grouped by
+   depth tier so panels keep their relative elevation under any theme. */
+.edit-theme-scope .bg-\[\#07050a\],
+.edit-theme-scope .bg-\[\#07080c\] { background-color: var(--et-canvas); }
+.edit-theme-scope .bg-\[\#0a080f\],
+.edit-theme-scope .bg-\[\#0a0c14\],
+.edit-theme-scope .bg-\[\#0d0b16\],
+.edit-theme-scope .bg-\[\#0f0f12\],
+.edit-theme-scope .bg-\[\#101215\],
+.edit-theme-scope .bg-\[\#111114\],
+.edit-theme-scope .bg-zinc-950,
+.edit-theme-scope .bg-zinc-900 { background-color: var(--et-popup); }
+.edit-theme-scope .bg-\[\#0c0a12\],
+.edit-theme-scope .bg-\[\#0c0a14\],
+.edit-theme-scope .bg-\[\#15171b\],
+.edit-theme-scope .bg-\[\#150f22\],
+.edit-theme-scope .bg-\[\#140e20\],
+.edit-theme-scope .bg-zinc-800,
+.edit-theme-scope .bg-zinc-700 { background-color: var(--et-panel); }
+.edit-theme-scope .bg-\[\#202329\],
+.edit-theme-scope .bg-\[\#343841\],
+.edit-theme-scope .bg-\[\#3a3d45\],
+.edit-theme-scope .bg-\[\#3b3f47\],
+.edit-theme-scope .bg-\[\#454a54\],
+.edit-theme-scope .bg-\[\#4a4f59\],
+.edit-theme-scope .bg-zinc-600,
+.edit-theme-scope .bg-zinc-500 { background-color: var(--et-elevated, var(--et-panel)); }
+.edit-theme-scope .bg-zinc-950\/95,
+.edit-theme-scope .bg-zinc-900\/95 { background-color: rgb(var(--et-shade) / 0.95); }
+.edit-theme-scope .bg-zinc-500\/10 { background-color: rgb(var(--et-tint) / 0.10); }
+.edit-theme-scope .bg-zinc-500\/20 { background-color: rgb(var(--et-tint) / 0.20); }
+.edit-theme-scope .bg-slate-500\/30 { background-color: rgb(var(--et-tint) / 0.14); }
+
+/* White-opacity subtle fills → themed tint. */
+.edit-theme-scope .bg-white\/2 { background-color: rgb(var(--et-tint) / 0.02); }
+.edit-theme-scope .bg-white\/5 { background-color: rgb(var(--et-tint) / 0.05); }
+.edit-theme-scope .bg-white\/10 { background-color: rgb(var(--et-tint) / 0.10); }
+.edit-theme-scope .bg-white\/20 { background-color: rgb(var(--et-tint) / 0.20); }
+.edit-theme-scope .bg-white\/30 { background-color: rgb(var(--et-tint) / 0.30); }
+.edit-theme-scope .bg-white\/40 { background-color: rgb(var(--et-tint) / 0.40); }
+.edit-theme-scope .bg-white\/60 { background-color: rgb(var(--et-tint) / 0.60); }
+.edit-theme-scope .bg-white\/70 { background-color: rgb(var(--et-tint) / 0.70); }
+
+/* Borders. */
+.edit-theme-scope .border-white\/5 { border-color: rgb(var(--et-line) / 0.05); }
+.edit-theme-scope .border-white\/8 { border-color: rgb(var(--et-line) / 0.08); }
+.edit-theme-scope .border-white\/10 { border-color: rgb(var(--et-line) / 0.10); }
+.edit-theme-scope .border-white\/15 { border-color: rgb(var(--et-line) / 0.15); }
+.edit-theme-scope .border-white\/25 { border-color: rgb(var(--et-line) / 0.25); }
+.edit-theme-scope .border-white\/40 { border-color: rgb(var(--et-line) / 0.40); }
+.edit-theme-scope .border-\[\#1a1528\],
+.edit-theme-scope .border-\[\#221d36\],
+.edit-theme-scope .border-\[\#1a1d28\],
+.edit-theme-scope .border-zinc-800,
+.edit-theme-scope .border-zinc-700 { border-color: var(--et-line-hex); }
+.edit-theme-scope .border-zinc-600,
+.edit-theme-scope .border-zinc-500 { border-color: rgb(var(--et-line) / 0.30); }
+.edit-theme-scope .border-zinc-600\/40 { border-color: rgb(var(--et-line) / 0.26); }
+.edit-theme-scope .border-zinc-500\/30 { border-color: rgb(var(--et-line) / 0.20); }
+.edit-theme-scope .border-zinc-500\/20 { border-color: rgb(var(--et-line) / 0.15); }
+.edit-theme-scope .border-slate-500\/60 { border-color: rgb(var(--et-line) / 0.32); }
+
+/* Light themes: keep the dim label/value text legible over light surfaces.
+ * Solid semantic text (text-white on colored buttons, text-purple, etc.) is
+ * left alone; only the neutral inherited + dim-utility text is darkened. */
+.edit-theme-scope[data-et-light="1"] {
+  color: rgb(var(--et-ink));
+  --text-primary: rgb(var(--et-ink));
+  --text-secondary: rgb(var(--et-ink) / 0.62);
+  --muted: rgb(var(--et-ink) / 0.45);
+}
+.edit-theme-scope[data-et-light="1"] .text-white\/40 { color: rgb(var(--et-ink) / 0.60); }
+.edit-theme-scope[data-et-light="1"] .text-white\/50 { color: rgb(var(--et-ink) / 0.66); }
+.edit-theme-scope[data-et-light="1"] .text-white\/60 { color: rgb(var(--et-ink) / 0.72); }
+.edit-theme-scope[data-et-light="1"] .text-white\/70 { color: rgb(var(--et-ink) / 0.80); }
+.edit-theme-scope[data-et-light="1"] .text-white\/80 { color: rgb(var(--et-ink) / 0.88); }
+.edit-theme-scope[data-et-light="1"] .text-zinc-300,
+.edit-theme-scope[data-et-light="1"] .text-zinc-400,
+.edit-theme-scope[data-et-light="1"] .text-zinc-500,
+.edit-theme-scope[data-et-light="1"] .text-zinc-600 { color: rgb(var(--et-ink) / 0.70); }
+.edit-theme-scope[data-et-light="1"] .text-zinc-100,
+.edit-theme-scope[data-et-light="1"] .text-zinc-200,
+.edit-theme-scope[data-et-light="1"] .text-\[\#f5f3ff\] { color: rgb(var(--et-ink)); }

@@ -47,6 +47,14 @@ export default defineConfig(({mode}) => {
       // Modern output → less transpilation across the ~3.5k modules.
       target: 'es2022',
       rollupOptions: {
+        // Two entries: the desktop app (index.html) and the phone companion
+        // (mobile.html -> src/mobile/main.tsx). The mobile tree never imports
+        // three/alphaTab/force-graph, so its chunk stays small; the phone never
+        // downloads the desktop bundle.
+        input: {
+          main: path.resolve(__dirname, 'index.html'),
+          mobile: path.resolve(__dirname, 'mobile.html'),
+        },
         output: {
           // Split the big, stable leaf vendors into their own long-cached
           // chunks so an app-code edit doesn't bust them, and the main chunk
@@ -59,11 +67,22 @@ export default defineConfig(({mode}) => {
             three: ['three'],
             wavesurfer: ['wavesurfer.js', '@wavesurfer/react'],
             icons: ['lucide-react'],
+            // Heavy leaf libs pulled in by specific features; give them their own
+            // long-cached chunks so they leave the main entry chunk (and an app
+            // edit never busts them). Behaviour is unchanged — pure bundling.
+            genai: ['@google/genai'],
+            markdown: ['react-markdown', 'remark-gfm', 'marked'],
+            spessasynth: ['spessasynth_core', 'spessasynth_lib'],
+            maplibre: ['maplibre-gl'],
           },
         },
       },
     },
     server: {
+      // Bind ALL interfaces so the phone companion is LAN-reachable even if the
+      // dev server is launched without the --host flag. Must never be
+      // loopback-only. (The npm "dev" script also passes --host=0.0.0.0.)
+      host: '0.0.0.0',
       // Auto-reload is OFF BY DEFAULT so agent edits don't nuke app state.
       // To turn live reload back on: set ENABLE_HMR=true in the environment.
       port: 5173,
@@ -90,6 +109,13 @@ export default defineConfig(({mode}) => {
               }
             });
           },
+        },
+        // The VJ tab embeds the backend-served static VJ build (vite base
+        // '/vj-app/'). Proxy it to the backend so the iframe loads it
+        // same-origin in dev, exactly as it already is in packaged/Docker.
+        '/vj-app': {
+          target: 'http://localhost:8600',
+          changeOrigin: true,
         },
       },
       hmr: process.env.ENABLE_HMR === 'true',

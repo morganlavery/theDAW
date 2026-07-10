@@ -165,8 +165,39 @@ export async function pickFolder(): Promise<PathPickerResult> {
   return json(await fetch('/api/storage/pick-folder', { method: 'POST' }));
 }
 
-export async function pickFile(): Promise<PathPickerResult> {
-  return json(await fetch('/api/storage/pick-file', { method: 'POST' }));
+export async function pickFile(opts?: { filter?: string; title?: string }): Promise<PathPickerResult> {
+  // Always send a (possibly empty) JSON body; the backend defaults to an
+  // "All files" filter so project/audio files are never hidden.
+  return json(
+    await fetch('/api/storage/pick-file', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(opts ?? {}),
+    }),
+  );
+}
+
+export async function pickSave(opts?: {
+  filter?: string;
+  title?: string;
+  initialDir?: string;
+  initialName?: string;
+  defaultExt?: string;
+}): Promise<PathPickerResult> {
+  // Native Save As dialog (for .tasmo saves). The backend snake_cases the keys.
+  return json(
+    await fetch('/api/storage/pick-save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filter: opts?.filter,
+        title: opts?.title,
+        initial_dir: opts?.initialDir,
+        initial_name: opts?.initialName,
+        default_ext: opts?.defaultExt,
+      }),
+    }),
+  );
 }
 
 export async function fetchModelStatus(): Promise<ModelStatusResponse> {

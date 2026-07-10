@@ -1,8 +1,8 @@
 """
 Mini RAG system — indexes theDAW markdown docs into ChromaDB.
 
-On startup, scans docs/, CLAUDE.md, and frontend/public/USER_GUIDE.md.
-Chunks by markdown ## headers. Embeds with all-MiniLM-L6-v2.
+On startup, indexes CLAUDE.md plus the user-facing docs registered in
+DOC_PATHS below. Chunks by markdown ## headers. Embeds with all-MiniLM-L6-v2.
 Retrieves top-5 chunks per query with source citations.
 """
 
@@ -20,22 +20,44 @@ RAG_INDEX_DIR = PROJECT_ROOT / "backend" / "rag_index"
 
 DOC_PATHS = [
     PROJECT_ROOT / "CLAUDE.md",
+    # User-facing project overview for the assistant. Lives under docs/ so it is
+    # shipped in the packaged desktop build (which bundles docs/**/*.md but not
+    # the repo-root CLAUDE.md), keeping the assistant's project framing intact
+    # without exposing internal dev guidance to end users.
+    PROJECT_ROOT / "docs" / "guides" / "about-thedaw.md",
     PROJECT_ROOT / "docs" / "SHOWCASE.md",
     PROJECT_ROOT / "docs" / "USER_GUIDE.md",
-    PROJECT_ROOT / "docs" / "DESIGN_PRINCIPLES.md",
     PROJECT_ROOT / "docs" / "guides" / "prompting.md",
     PROJECT_ROOT / "docs" / "guides" / "SUNO_EXTERNAL_API.md",
     PROJECT_ROOT / "docs" / "guides" / "ui-controls-guide.md",
     PROJECT_ROOT / "docs" / "guides" / "model-overview.md",
     PROJECT_ROOT / "docs" / "guides" / "dj-and-genealogy.md",
     PROJECT_ROOT / "docs" / "guides" / "notation-and-score.md",
+    PROJECT_ROOT / "docs" / "guides" / "foundry.md",
+    PROJECT_ROOT / "docs" / "guides" / "underfit.md",
     PROJECT_ROOT / "docs" / "UI" / "hover-text-guide.md",
     PROJECT_ROOT / "docs" / "workflows" / "lora.md",
+    PROJECT_ROOT / "docs" / "workflows" / "underfit-lora-training.md",
     PROJECT_ROOT / "docs" / "workflows" / "inference.md",
     PROJECT_ROOT / "docs" / "workflows" / "autoencoder.md",
     PROJECT_ROOT / "docs" / "windows" / "setup-guide.md",
     PROJECT_ROOT / "docs" / "windows" / "troubleshooting.md",
-    PROJECT_ROOT / "frontend" / "public" / "USER_GUIDE.md",
+    # Shipped feature guides that were previously left out of the index.
+    PROJECT_ROOT / "docs" / "guides" / "hrtf-spatializer.md",
+    PROJECT_ROOT / "docs" / "guides" / "underfit-propagation.md",
+    # Feature guides added in the July 2026 documentation overhaul.
+    PROJECT_ROOT / "docs" / "guides" / "edit-automation.md",
+    PROJECT_ROOT / "docs" / "guides" / "mix-vst-and-gan.md",
+    PROJECT_ROOT / "docs" / "guides" / "projects-and-daw-import.md",
+    PROJECT_ROOT / "docs" / "guides" / "quest-deploy.md",
+    PROJECT_ROOT / "docs" / "guides" / "backup-and-updates.md",
+    PROJECT_ROOT / "docs" / "guides" / "electron-desktop-app.md",
+    PROJECT_ROOT / "docs" / "guides" / "pinokio-launcher.md",
+    PROJECT_ROOT / "docs" / "guides" / "audimate.md",
+    PROJECT_ROOT / "docs" / "guides" / "levels.md",
+    # The manual is indexed once, from docs/USER_GUIDE.md. The byte-identical
+    # frontend/public/USER_GUIDE.md mirror that Vite serves for the in-app Docs
+    # modal is intentionally not indexed here, to avoid embedding the manual twice.
 ]
 
 _collection = None

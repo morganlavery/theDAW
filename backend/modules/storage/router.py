@@ -971,14 +971,33 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
     return _run_windows_picker(script).model_dump()
 
 
+class PickFileRequest(BaseModel):
+    # Optional OpenFileDialog filter, e.g.
+    # "Audio (*.wav;*.flac)|*.wav;*.flac|All files (*.*)|*.*". Defaults to all
+    # files so the dialog never hides project/audio files behind a model filter.
+    filter: str | None = None
+    title: str | None = None
+
+
+def _ps_single_quote(value: str) -> str:
+    """Escape a string for embedding inside a single-quoted PowerShell literal.
+
+    Single-quoted PS strings treat ``$`` and backticks literally, so doubling
+    the single quote is enough to prevent breakout; newlines are flattened.
+    """
+    return value.replace("\r", " ").replace("\n", " ").replace("'", "''")
+
+
 @router.post("/pick-file")
-def storage_pick_file() -> dict:
+def storage_pick_file(req: PickFileRequest | None = None) -> dict:
+    flt = (req.filter if req and req.filter else None) or "All files (*.*)|*.*"
+    title = (req.title if req and req.title else None) or "Select a file for theDAW"
     script = r"""
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = 'Select a file for theDAW'
-$dialog.Filter = 'Model/config files (*.safetensors;*.json)|*.safetensors;*.json|All files (*.*)|*.*'
+$dialog.Title = '__TITLE__'
+$dialog.Filter = '__FILTER__'
 $dialog.Multiselect = $false
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   Write-Output $dialog.FileName
@@ -986,4 +1005,32 @@ if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   exit 3
 }
 """
+    script = script.replace("__TITLE__", _ps_single_quote(title)).replace(
+        "__FILTER__", _ps_single_quote(flt)
+    )
     return _run_windows_picker(script).model_dump()
+
+
+class PickSaveRequest(BaseModel):
+    filter: str | None = None
+    title: str | None = None
+    initial_dir: str | None = None
+    initial_name: str | None = None
+    default_ext: str | None = None
+
+
+@router.post("/pick-save")
+def storage_pick_save(req: PickSaveRequest | None = None) -> dict:
+    """Open a native Save As dialog (for .tasmo project saves etc.). Returns
+    ``{cancelled, path}`` like the other pickers."""
+    from backend.core.folder_dialog import pick_save_file
+
+    r = req or PickSaveRequest()
+    path = pick_save_file(
+        title=r.title or "Save as",
+        initial_dir=r.initial_dir,
+        initial_name=r.initial_name,
+        default_ext=r.default_ext,
+        filter_spec=r.filter,
+    )
+    return {"cancelled": path is None, "path": path}
